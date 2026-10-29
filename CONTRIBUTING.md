@@ -2,43 +2,25 @@
 
 Thanks for your interest in contributing!
 
-This repo (`pullfrog/pullfrog`) is the open-source GitHub Action that powers Pullfrog. The rest of the product (web app, API) is proprietary and lives elsewhere, so contributions here focus on the action runtime.
+This repo (`pullfrog/pullfrog`) is the open-source GitHub Action that powers Pullfrog. It is a read-only mirror of the action's directory in Pullfrog's private monorepo, and every sync overwrites it, so it does not accept pull requests.
 
-## Prerequisites
+## Reporting a bug or requesting a feature
 
-- Node.js (see `.node-version` for the exact version)
-- The canonical toolchain is [`nub`](https://nubjs.com) (`nub install`, `nub run <script>`); [`pnpm`](https://pnpm.io/) also works against the same `pnpm-lock.yaml`.
+[Open an issue](https://github.com/pullfrog/pullfrog/issues/new/choose). For a bug, link the failing workflow run if you can. If you've written a fix, describe it in the issue or link the branch on your fork: a maintainer can port it into the monorepo, and it reaches this repo with the next sync.
 
-## Setup
+## Running the action locally
+
+You need Node.js (see `.node-version` for the exact version). The canonical toolchain is [`nub`](https://nubjs.com) (`nub install`, `nub run <script>`); [`pnpm`](https://pnpm.io/) also works against the same `pnpm-lock.yaml`.
 
 ```bash
-git clone https://github.com/<your-username>/pullfrog.git
+git clone https://github.com/pullfrog/pullfrog.git
 cd pullfrog
-nub install   # or: pnpm install
-```
-
-## Running tests
-
-```bash
+nub install         # or: pnpm install
 nub run typecheck   # or: pnpm typecheck
 nub run test        # or: pnpm test
 ```
 
-Run `typecheck` before opening a PR. Note that the full test suite needs credentials (GitHub App secrets) and some tests are LLM-driven, so a green local run isn't guaranteed without them — CI runs the complete matrix on your PR.
-
-## Commit conventions
-
-Use [Conventional Commits](https://www.conventionalcommits.org/): `feat:`, `fix:`, `docs:`, `chore:`, `test:`.
-
-Example: `feat(action): add prompt_file input`
-
-## Opening a PR
-
-1. Fork the repo
-2. Create a branch: `git checkout -b feat/your-feature`
-3. Make your changes
-4. Run `nub run typecheck` (and `nub run test` where you have the required credentials)
-5. Push and open a PR against `main`
+The full test suite needs credentials (GitHub App secrets) and some tests are LLM-driven, so a green local run isn't guaranteed without them.
 
 ## Questions?
 

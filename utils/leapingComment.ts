@@ -16,3 +16,16 @@ export function isLeapingIntoActionCommentBody(body: string): boolean {
   const firstLine = content.split(/\r?\n/, 1)[0]?.trimEnd() ?? "";
   return new RegExp(`(^|\\s)${LEAPING_INTO_ACTION_PREFIX}(\\.\\.\\.)?$`).test(firstLine);
 }
+
+/** the spinner on a to-do list's in-progress item. */
+export const TODO_SPINNER_URL = "https://uploads.pullfrog.com/Progress%20Indicator.gif";
+
+/**
+ * A live to-do list: one item still carries the spinner. Every finished body — a
+ * final summary, a salvaged answer, an error report — renders with in-progress
+ * items completed, so the spinner is only ever on a list whose run is still going
+ * or died without writing again.
+ */
+export function isLiveChecklistCommentBody(body: string): boolean {
+  return body.includes(TODO_SPINNER_URL);
+}

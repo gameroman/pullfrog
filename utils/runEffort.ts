@@ -5,7 +5,13 @@
  * see wiki/effort.md.
  */
 
-import { DEFAULT_EFFORT_POSITION, type EffortPosition, rungPosition } from "../effort.ts";
+import {
+  DEFAULT_EFFORT_POSITION,
+  type EffortPosition,
+  resolveRung,
+  rungPosition,
+  SUBSIDY_RUNG,
+} from "../effort.ts";
 import { AZURE_PROVIDER, type ModelAlias, modelAliases, resolveModelRung } from "../models.ts";
 import type { ResolvedPayload } from "./payload.ts";
 
@@ -22,6 +28,11 @@ export interface RunEffort {
   rung: string | undefined;
   /** the catalog alias the ladder came from, if we recognized one. */
   alias: ModelAlias | undefined;
+  /**
+   * true when the catalog has no ladder for a configured effort and the variants
+   * the opencode server declares for the model may stand in (`declaredVariants`).
+   */
+  declarable: boolean;
 }
 
 /**
@@ -53,7 +64,7 @@ function matchHostedAnthropicAlias(modelId: string): ModelAlias | undefined {
  *
  * both inputs are concrete specifiers rather than slugs, so this is a reverse
  * lookup. aliases sharing a target publish the same ladder (`openai/gpt-sol` and
- * `openai/gpt-sol-pro` both resolve to `openai/gpt-5.6-sol`), pinned by the catalog
+ * `openai/gpt-sol-pro` both resolve to `openai/gpt-6.1-sol`), pinned by the catalog
  * test; deprecated aliases are skipped because they never run as-is.
  */
 function resolveRunAlias(ctx: {
@@ -96,12 +107,17 @@ export function ossEffortFloor(ctx: { payload: ResolvedPayload }): EffortPositio
   const alias = resolveRunAlias(ctx);
   const published = alias?.openRouterEffort ?? alias?.effort;
   if (!published) return 0;
-  return rungPosition({ rung: "high", published }) ?? 0;
+  return rungPosition({ rung: SUBSIDY_RUNG, published }) ?? 0;
 }
 
 export function resolveRunEffort(ctx: {
   payload: ResolvedPayload;
   resolvedModel?: string | undefined;
+  /**
+   * the variant names the opencode server lists for the running model, in its
+   * order. only consulted when the catalog has no alias for the model.
+   */
+  declaredVariants?: readonly string[] | undefined;
 }): RunEffort {
   const configured = ctx.payload.effort !== undefined;
   const position = ctx.payload.effort ?? DEFAULT_EFFORT_POSITION;
@@ -113,7 +129,18 @@ export function resolveRunEffort(ctx: {
   // know the real model (the opencode harness, which resolves
   // `autoSelectModel()` itself) should pass it as `resolvedModel` so the ladder
   // resolves. see wiki/effort.md.
-  if (!alias) return { position, configured, rung: undefined, alias: undefined };
+  if (!alias) {
+    // a model the opencode server lists is one it can place, so its declared
+    // variants are a safe ladder. only a configured effort uses it: the default
+    // position was tuned on catalog ladders, so an unset one keeps the provider's.
+    // azure stays out: a deployment named like a catalog model need not serve it.
+    const declarable = configured && !ctx.resolvedModel?.startsWith(`${AZURE_PROVIDER}/`);
+    const rung =
+      declarable && ctx.declaredVariants
+        ? resolveRung({ position, published: ctx.declaredVariants })
+        : undefined;
+    return { position, configured, rung, alias: undefined, declarable };
+  }
   return {
     position,
     configured,
@@ -123,5 +150,6 @@ export function resolveRunEffort(ctx: {
       useOpenRouter: !!ctx.payload.proxyModel,
     }),
     alias,
+    declarable: false,
   };
 }

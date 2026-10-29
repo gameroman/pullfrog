@@ -2,8 +2,13 @@ import { basename } from "node:path";
 import arg from "arg";
 import pc from "picocolors";
 import { runCli as runAuthCli } from "./commands/auth.ts";
+import { runCli as runConfigCli } from "./commands/config.ts";
+import { runCli as runConsoleCli } from "./commands/console.ts";
 import { runCli as runGhaCli } from "./commands/gha.ts";
 import { runCli as runInitCli } from "./commands/init.ts";
+import { runCli as runMcpCli } from "./commands/mcp.ts";
+import { runCli as runRunCli } from "./commands/run.ts";
+import { runCli as runSecretCli } from "./commands/secret.ts";
 import { runCli as runWatchCli } from "./commands/watch.ts";
 
 const VERSION = process.env.CLI_VERSION ?? "0.0.0";
@@ -14,9 +19,14 @@ const rawArgs = process.argv.slice(2);
 function printMainUsage(stream: typeof console.log): void {
   stream(`usage: ${PROG} <command>\n`);
   stream("commands:");
-  stream("  init        set up pullfrog on the current repository");
+  stream("  config      inspect and change repository or organization settings");
+  stream("  console     open the repository or organization console");
+  stream("  secret      list secret names, save or delete scoped credentials");
+  stream("  init        install pullfrog on the current repository and open its dashboard");
+  stream("  run         start a run from a prompt, like the console's prompt box");
   stream("  auth        manage provider credentials for the current repository");
   stream("  watch       stream a PR's activity as one JSON line per event");
+  stream("  mcp         run a stdio MCP server exposing PR activity as an agent tool");
   stream("");
   stream("global options:");
   stream("  -h, --help      show help");
@@ -80,6 +90,18 @@ async function run(): Promise<void> {
     return;
   }
 
+  if (command === "run") {
+    await runRunCli({ args: commandArgs, prog: PROG, showHelp: globalParsed["--help"] === true });
+    return;
+  }
+
+  if (command === "config" || command === "console" || command === "secret") {
+    const runCommand =
+      command === "config" ? runConfigCli : command === "secret" ? runSecretCli : runConsoleCli;
+    await runCommand({ args: commandArgs, prog: PROG, showHelp: globalParsed["--help"] === true });
+    return;
+  }
+
   if (command === "gha") {
     await runGhaCli({
       args: commandArgs,
@@ -91,6 +113,15 @@ async function run(): Promise<void> {
 
   if (command === "auth") {
     await runAuthCli({
+      args: commandArgs,
+      prog: PROG,
+      showHelp: globalParsed["--help"] === true,
+    });
+    return;
+  }
+
+  if (command === "mcp") {
+    await runMcpCli({
       args: commandArgs,
       prog: PROG,
       showHelp: globalParsed["--help"] === true,

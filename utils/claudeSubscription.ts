@@ -10,12 +10,14 @@ const CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for 
 // fallback probe model for runs with no explicit model (claude-code picks its
 // own default there, so per-model accuracy is moot — only whether the
 // subscription answers at all). registry-resolved so the models-bump cron
-// keeps the id fresh.
-const fallbackResolve = resolveModelSlug("anthropic/claude-haiku");
-if (!fallbackResolve) {
-  throw new Error("claudeSubscription preflight: anthropic/claude-haiku missing from registry");
+// keeps the id fresh. read per call, so a registry run-context served applies.
+function fallbackProbeModel(): string {
+  const resolve = resolveModelSlug("anthropic/claude-haiku");
+  if (!resolve) {
+    throw new Error("claudeSubscription preflight: anthropic/claude-haiku missing from registry");
+  }
+  return resolve.slice(resolve.indexOf("/") + 1);
 }
-const FALLBACK_PROBE_MODEL = fallbackResolve.slice(fallbackResolve.indexOf("/") + 1);
 
 /**
  * `status` is the HTTP status Anthropic answered with, or `undefined` when we
@@ -26,7 +28,7 @@ const FALLBACK_PROBE_MODEL = fallbackResolve.slice(fallbackResolve.indexOf("/") 
  */
 export type SubscriptionPreflight =
   | { usable: true; status: number | undefined }
-  | { usable: false; status: number; reason: string };
+  | { usable: false; status: number; reason: string; resetAt: Date | undefined };
 
 /**
  * preflight a Claude subscription OAuth token (`CLAUDE_CODE_OAUTH_TOKEN`)
@@ -54,6 +56,7 @@ export async function preflightClaudeSubscription(params: {
   /** bare Anthropic model id the run will use (e.g. "claude-fable-5") */
   model: string | undefined;
 }): Promise<SubscriptionPreflight> {
+  const model = params.model ?? fallbackProbeModel();
   let res: Response;
   try {
     res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -66,7 +69,7 @@ export async function preflightClaudeSubscription(params: {
         "x-app": "cli",
       },
       body: JSON.stringify({
-        model: params.model ?? FALLBACK_PROBE_MODEL,
+        model,
         max_tokens: 1,
         system: CLAUDE_CODE_IDENTITY,
         messages: [{ role: "user", content: "ok" }],
@@ -80,10 +83,14 @@ export async function preflightClaudeSubscription(params: {
   if (res.status !== 401 && res.status !== 403 && res.status !== 429)
     return { usable: true, status: res.status };
   const body = await res.text().catch(() => "");
+  // epoch seconds, sent on every subscription response — the moment a capped
+  // window opens again, which a 429's own message only gives in prose.
+  const reset = Number(res.headers.get("anthropic-ratelimit-unified-reset"));
   return {
     usable: false,
     status: res.status,
     reason: `${res.status}: ${extractApiErrorMessage(body)}`,
+    resetAt: res.status === 429 && reset > 0 ? new Date(reset * 1000) : undefined,
   };
 }
 

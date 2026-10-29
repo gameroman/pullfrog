@@ -16,10 +16,6 @@ type CompatibilityPolicy =
 
 const COMPATIBILITY_POLICY: CompatibilityPolicy = "non-breaking";
 
-function minVersion(range: string): string {
-  return normalize(findMinimumForRange(range)!)!;
-}
-
 /**
  * @throws Error if the action can't process payload
  * The compatibility is determined according to the COMPATIBILITY_POLICY above.
@@ -40,9 +36,10 @@ export function validateCompatibility(payloadVersion: string, actionVersion: str
       : `^${major}.${major === 0 ? minor : 0}.${major === 0 ? "x" : 0}`; // non-breaking
 
   if (!satisfies(actionVersion, compatibilityRange)) {
+    const minimum = findMinimumForRange(compatibilityRange);
     throw new Error(
       `Payload version ${payloadVersion} is incompatible with action version ${actionVersion}. ` +
-        `Please update your workflow to use at least ${minVersion(compatibilityRange)} version of the action.`
+        `Please update your workflow to use at least ${minimum && normalize(minimum)} version of the action.`
     );
   }
 }

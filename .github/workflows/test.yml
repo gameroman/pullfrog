@@ -27,12 +27,13 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        agent: [claude, opencode]
+        agent: [claude, codex, opencode]
         test:
           [
             bedrock-claude,
             codex-auth,
             fs-exfil,
+            gitwrite,
             mcpmerge,
             nobash,
             restricted,
@@ -46,13 +47,21 @@ jobs:
         exclude:
           - agent: opencode
             test: bedrock-claude
+          - agent: codex
+            test: bedrock-claude
           - agent: claude
+            test: skill-invoke-opencode
+          - agent: codex
             test: skill-invoke-opencode
           - agent: claude
             test: codex-auth
           - agent: opencode
             test: skill-invoke-claude
+          - agent: codex
+            test: skill-invoke-claude
           - agent: claude
+            test: vertex-opencode
+          - agent: codex
             test: vertex-opencode
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -64,7 +73,10 @@ jobs:
       XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
       DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      AI_GATEWAY_API_KEY: ${{ secrets.AI_GATEWAY_API_KEY }}
       MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
+      KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+      META_MODEL_API_KEY: ${{ secrets.META_MODEL_API_KEY }}
       OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
       AWS_BEARER_TOKEN_BEDROCK: ${{ secrets.AWS_BEARER_TOKEN_BEDROCK }}
       AWS_REGION: us-east-1
@@ -72,7 +84,7 @@ jobs:
       VERTEX_SERVICE_ACCOUNT_JSON: ${{ secrets.VERTEX_SERVICE_ACCOUNT_JSON }}
       GOOGLE_CLOUD_PROJECT: pullfrog
       VERTEX_LOCATION: global
-      VERTEX_MODEL_ID: gemini-2.5-flash
+      VERTEX_MODEL_ID: gemini-3.8-flash
       PULLFROG_MODEL: ${{ vars.PULLFROG_MODEL }}
       # CI smoke-testing shortcut only — production stores this in Pullfrog's
       # per-org secret store (Postgres), set via `pullfrog auth codex`. GH
@@ -81,6 +93,9 @@ jobs:
       # manually re-provision when smoke tests start failing. Do not copy this
       # pattern into user-facing workflows. See wiki/codex-auth.md.
       CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+      # Same CI-shortcut caveat, and staler sooner — Grok access tokens live
+      # ~6h. Production path is `pullfrog auth grok`. See wiki/grok-auth.md.
+      GROK_AUTH_JSON: ${{ secrets.GROK_AUTH_JSON }}
     steps:
       - uses: actions/checkout@v6
       - uses: pnpm/action-setup@v4

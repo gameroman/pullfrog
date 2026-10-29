@@ -5,22 +5,26 @@
  */
 
 import type { EffortPosition } from "./effort.ts";
+import type { RouterTier } from "./models.ts";
 
 // mcp name constant
 export const pullfrogMcpName = "pullfrog";
 
 /** @see {@link file://./agents/shared.ts} Agent interface that uses this type */
-export type AgentId = "claude" | "opencode";
+export type AgentId = "claude" | "codex" | "opencode";
 
 /**
  * format a tool name the way each agent's MCP client presents it to the model.
  * claude code: mcp__pullfrog__select_mode
+ * codex:       pullfrog__select_mode
  * opencode:    pullfrog_select_mode
  */
 export function formatMcpToolRef(agentId: AgentId, toolName: string): string {
   switch (agentId) {
     case "claude":
       return `mcp__${pullfrogMcpName}__${toolName}`;
+    case "codex":
+      return `${pullfrogMcpName}__${toolName}`;
     case "opencode":
       return `${pullfrogMcpName}_${toolName}`;
     default:
@@ -91,12 +95,22 @@ export {
   resolveRung,
   rungLabel,
   rungPosition,
+  SUBSIDY_RUNG,
 } from "./effort.ts";
 // model alias registry lives in models.ts — re-exported here for shared access
-export type { AutoTier, ModelAlias, ModelProvider, ProviderConfig } from "./models.ts";
+export type {
+  AutoTier,
+  ModelAlias,
+  ModelProvider,
+  ProviderConfig,
+  RouterTier,
+} from "./models.ts";
 export {
   AUTO_EFFICIENT,
   AUTO_INTELLIGENT,
+  AUTO_ROUTER,
+  autoLadder,
+  autoRoutedSlug,
   DEFAULT_PROXY_MODEL,
   defaultAutoTier,
   getAutoSelectHintModel,
@@ -105,22 +119,35 @@ export {
   getModelManagedCredentials,
   getModelProvider,
   getProviderDisplayName,
+  isAutoRouted,
+  isAutoSlug,
   isAutoTier,
   isCardGatedModel,
   isOssAllowedModel,
+  isRouterTier,
+  ladderRungs,
   modelAliases,
   modelHasStoredAuth,
+  modelIdLabel,
   OSS_MODEL_ALLOWLIST,
   OSS_RECOMMENDED_MODEL,
   ossFundedModelNames,
+  PROVIDER_GATEWAY_URL_ENV,
   parseModel,
   providers,
+  ROUTED_PROVIDERS,
+  ROUTER_LADDER,
+  ROUTER_TIERS,
   resolveAutoTier,
   resolveCliModel,
   resolveDisplayAlias,
   resolveModelRung,
   resolveModelSlug,
   resolveOpenRouterModel,
+  resolvePickModel,
+  resolveRoutedModel,
+  routerProxyOptOut,
+  TRIAL_FUNDED_USD_LIMIT,
 } from "./models.ts";
 
 // tool permission types shared with server dispatch
@@ -178,7 +205,7 @@ interface BasePayloadEvent {
   };
   comment_ids?: number[] | "all";
   /** permission level of the user who triggered this event */
-  authorPermission?: AuthorPermission;
+  authorPermission?: AuthorPermission | undefined;
   /** when true, runs silently without progress comments (e.g., auto-labeling) */
   silent?: boolean;
   [key: string]: any;
@@ -220,6 +247,15 @@ interface PullRequestReviewSubmittedEvent extends BasePayloadEvent {
   body: string | null;
   review_state: string;
   branch: string;
+  /**
+   * How far past the dispatching review this run may read: `all` on a
+   * Pullfrog-authored PR, `mentions` when only `@pullfrog`-mentioning threads
+   * are in scope. The server already computes this to decide whether to
+   * dispatch; forwarding it is what lets `get_review_comments` pick up the
+   * comments that land while the run is working. Optional so a payload from an
+   * older server build still parses against a newer action.
+   */
+  address_scope?: "all" | "mentions" | undefined;
 }
 
 interface PullRequestReviewCommentCreatedEvent extends BasePayloadEvent {
@@ -368,11 +404,36 @@ export interface XrepoConfig {
   unavailable?: string[] | undefined;
 }
 
+/**
+ * the model router's decision, carried so the runner can log it and forward the
+ * tier to run-context as `?tier=` — the Router proxy mint happens there and
+ * never sees `model` below. see wiki/router.md.
+ */
+export interface PayloadRouting {
+  tier: RouterTier;
+  stakes: number;
+  workload: number;
+  /** who decided: Jev, the chat scorer it falls back to, the heuristic behind that, or the fixed tier a non-review kind of work carries. mirrors the `RouterSource` enum. */
+  source: RouterSource;
+  /** the chat scorer's own sentence or two on what a reviewer must reconstruct; Jev's tier probabilities and axes instead */
+  rationale: string;
+}
+
+export type RouterSource = "jev" | "scorer" | "heuristic" | "fixed";
+
 // writeable payload type for building payloads
 export interface WriteablePayload {
   "~pullfrog": true;
   /** semantic version of the payload to ensure compatibility */
   version: string;
+  /**
+   * which kind of work this run is (`pr-created`, `issue-created`, …). the
+   * server's own run-type vocabulary, opaque here: the action only forwards it
+   * to `run-context`, which resolves the repo's per-trigger model override
+   * against it. absent ⇒ the repo default, which is what every run got before
+   * overrides existed.
+   */
+  type?: string | undefined;
   /** provider/model slug (e.g. "anthropic/claude-opus") */
   model?: string | undefined;
   /**
@@ -382,6 +443,8 @@ export interface WriteablePayload {
    * baseInstructions flag) keeps the soft-fallback safety net. see modelAccess.ts.
    */
   modelExplicit?: boolean | undefined;
+  /** the model router's decision, when it made one; `model` above already reflects it */
+  routing?: PayloadRouting | undefined;
   /** reasoning-effort position on [0,1]; 0 is the model's cheapest rung, 1 its priciest */
   effort?: EffortPosition | undefined;
   /**
@@ -419,6 +482,13 @@ export interface WriteablePayload {
    * (every cross-repo runtime branch gates on this being present).
    */
   xrepo?: XrepoConfig | undefined;
+  /**
+   * opaque handle to the cross-repo grant the server persisted for this run.
+   * presented when minting cross-repo-scoped tokens; the server reads the repo
+   * sets from its own row, so this can widen nothing on its own. absent ⇒ the
+   * mint is scoped to the primary repo alone.
+   */
+  xrepoGrant?: string | undefined;
   /** timeout for agent run (e.g., "10m", "1h30m") - defaults to "1h" */
   timeout?: string | undefined;
   /** working directory for the agent */
@@ -433,6 +503,13 @@ export interface WriteablePayload {
   checkRun?: { id: string } | undefined;
   /** when true, seed the PR summary tmpfile + persist edits at run end */
   generateSummary?: boolean | undefined;
+  /**
+   * the codex canary assigned this run to the EXPERIMENTAL codex harness. rolled
+   * once server-side at reservation and stamped on the run row, so the row and the
+   * run always agree on which arm this was. ORed with the account opt-in in
+   * `resolveAgent` — it widens who reaches codex, never narrows it.
+   */
+  codexArm?: boolean | undefined;
 }
 
 // immutable payload type for agent execution
@@ -440,12 +517,13 @@ export type Payload = Readonly<WriteablePayload>;
 
 /**
  * Whether `find_similar_issues` is registered for this run: an entitled account,
- * on an issue rather than a PR. Shared by the MCP registration and the prompt so
- * the duplicate-detection instructions can never describe an absent tool.
+ * on an issue or a run with no target (`pullfrog run "enrich issue #42"`), never a PR.
+ * Shared by the MCP registration and the prompt so the duplicate-detection
+ * instructions can never describe an absent tool.
  */
 export function hasSimilarIssues(params: {
   repoIntelligence: boolean;
   event: PayloadEvent;
 }): boolean {
-  return params.repoIntelligence && !!params.event.issue_number && !params.event.is_pr;
+  return params.repoIntelligence && !params.event.is_pr;
 }

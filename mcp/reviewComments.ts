@@ -2,10 +2,12 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Octokit } from "@octokit/rest";
 import { type } from "arktype";
+import * as yes from "yes";
 import { resolveBodyAssets } from "../utils/body.ts";
 import { stripExistingFooter } from "../utils/buildPullfrogFooter.ts";
+import { isPullfrog, mentionableText, mentionHandles } from "../utils/isPullfrog.ts";
 import { log } from "../utils/log.ts";
-import * as yes from "../yes/index.ts";
+import { isOutsideAuthor } from "../utils/payload.ts";
 import type { ToolContext } from "./server.ts";
 import { execute, tool } from "./shared.ts";
 
@@ -40,7 +42,7 @@ query ($owner: String!, $name: String!, $prNumber: Int!, $cursor: String) {
               startLine
               originalLine
               originalStartLine
-              author { login }
+              author { login __typename }
               pullRequestReview {
                 databaseId
                 author { login }
@@ -72,7 +74,7 @@ export type ReviewThreadComment = {
   startLine: number | null;
   originalLine: number | null;
   originalStartLine: number | null;
-  author: { login: string } | null;
+  author: { login: string; __typename: string } | null;
   pullRequestReview: {
     databaseId: number | null;
     author: { login: string } | null;
@@ -302,6 +304,9 @@ function extractFromFilePatches(
 export const GetReviewComments = type({
   pull_number: type.number.describe("The pull request number"),
   review_id: type.number.describe("The review ID to get comments for"),
+  "fresh?": type.boolean.describe(
+    "Bypass the 60s thread cache. Use for the re-read before committing, so comments that landed while you worked are actually seen; leave unset otherwise."
+  ),
 });
 
 function hasThumbsUpFrom(comment: ReviewThreadComment, username: string): boolean {
@@ -351,7 +356,7 @@ export function formatReviewThreads(
 
   const lines: string[] = [];
   lines.push(
-    `# Review Threads (${threadBlocks.length}) for PR #${header.pullNumber} - Review ${header.reviewId} by ${header.reviewer}`
+    `# Open Threads (${threadBlocks.length}) on PR #${header.pullNumber} - dispatched by Review ${header.reviewId} from ${header.reviewer}`
   );
   lines.push("");
   if (threadBlocks.length > 0) {
@@ -487,8 +492,11 @@ export function buildThreadBlocks(
  * Two-arg form on purpose: `yes.op` excludes the second parameter from the
  * cache key, so the octokit client is never hashed into it.
  */
-const fetchAllReviewThreads = yes.op(
-  async (key: { owner: string; name: string; pullNumber: number }, ctx: { octokit: Octokit }) => {
+const fetchAllReviewThreads = yes.query({
+  run: async (
+    key: { owner: string; name: string; pullNumber: number },
+    ctx: { octokit: Octokit }
+  ) => {
     const threads: (ReviewThread | null)[] = [];
     let cursor: string | null = null;
     // bound the walk so a misbehaving cursor can't loop forever; 50 pages =
@@ -508,19 +516,38 @@ const fetchAllReviewThreads = yes.op(
     }
     return threads;
   },
-  { ttl: 60_000, name: "reviewThreads" }
-);
+  ttl: 60_000,
+  name: "reviewThreads",
+});
 
-const fetchPrFiles = yes.op(
-  async (key: { owner: string; name: string; pullNumber: number }, ctx: { octokit: Octokit }) =>
+const fetchPrFiles = yes.query({
+  run: async (
+    key: { owner: string; name: string; pullNumber: number },
+    ctx: { octokit: Octokit }
+  ) =>
     ctx.octokit.paginate(ctx.octokit.rest.pulls.listFiles, {
       owner: key.owner,
       repo: key.name,
       pull_number: key.pullNumber,
       per_page: 100,
     }),
-  { ttl: 60_000, name: "prFiles" }
-);
+  ttl: 60_000,
+  name: "prFiles",
+});
+
+/** cached like the threads themselves, so a run re-reading its review looks each author up once */
+const fetchPermissionLevel = yes.query({
+  run: async (key: { owner: string; name: string; username: string }, ctx: { octokit: Octokit }) =>
+    (
+      await ctx.octokit.rest.repos.getCollaboratorPermissionLevel({
+        owner: key.owner,
+        repo: key.name,
+        username: key.username,
+      })
+    ).data.permission,
+  ttl: 60_000,
+  name: "permissionLevel",
+});
 
 /**
  * Drop the cached thread graph after a mutation that changes resolved state,
@@ -530,9 +557,7 @@ const fetchPrFiles = yes.op(
  * nothing and cannot miss.
  */
 function invalidateReviewThreadCache(repo: { owner: string; name: string }): void {
-  fetchAllReviewThreads.invalidate(
-    (cached) => cached.owner === repo.owner && cached.name === repo.name
-  );
+  fetchAllReviewThreads.invalidate({ owner: repo.owner, name: repo.name });
 }
 
 async function getReviewThreads(input: GetReviewDataInput) {
@@ -561,12 +586,107 @@ async function getReviewThreads(input: GetReviewDataInput) {
     return thread.comments.nodes.some((c) => c?.pullRequestReview?.databaseId === input.reviewId);
   });
 
-  if (!input.approvedBy) {
-    return threadsForReview;
+  if (input.approvedBy) {
+    const username = input.approvedBy;
+    return threadsForReview.filter((thread) => threadHasThumbsUpFrom(thread, username));
   }
 
-  const username = input.approvedBy;
-  return threadsForReview.filter((thread) => threadHasThumbsUpFrom(thread, username));
+  if (!input.addressScope) return threadsForReview;
+
+  return [...threadsForReview, ...concurrentThreads(allThreads, threadsForReview, input)];
+}
+
+/**
+ * What a push-capable run may read as feedback: the review it asked for, and beyond
+ * it only comments from a bot or from someone who can push here themselves.
+ * The server clamps a run by whoever dispatched it alone, so without this a
+ * stranger's reply in that review's thread, or a stranger's concurrent thread,
+ * could steer the push (#1484). A failed lookup proves nothing and drops the comment.
+ */
+async function writerComments(input: GetReviewDataInput, threads: ReviewThread[]) {
+  const vouched = (c: ReviewThreadComment) =>
+    c.author?.__typename === "Bot" || c.pullRequestReview?.databaseId === input.reviewId;
+  const comments = threads.flatMap((thread) => thread.comments?.nodes ?? []);
+  const logins = new Set(
+    comments.flatMap((c) => (c?.author && !vouched(c) ? [c.author.login] : []))
+  );
+  const writers = new Set<string>();
+  await Promise.all(
+    [...logins].map(async (username) => {
+      const permission = await fetchPermissionLevel(
+        { owner: input.owner, name: input.name, username },
+        { octokit: input.octokit }
+      ).catch(() => "none");
+      if (permission === "admin" || permission === "write") writers.add(username);
+    })
+  );
+  return threads.flatMap((thread) => {
+    const nodes = (thread.comments?.nodes ?? []).filter(
+      (c) => c && (vouched(c) || (c.author && writers.has(c.author.login)))
+    );
+    return nodes.length > 0 ? [{ ...thread, comments: { nodes } }] : [];
+  });
+}
+
+/**
+ * Open threads on the PR that this run should also address, beyond the review
+ * that dispatched it.
+ *
+ * A reviewer working through a PR emits one `pull_request_review_submitted` per
+ * submission, so a second review lands seconds after the first — and until this
+ * existed, the run already working on the PR could never see it: the filter
+ * above keeps only threads carrying a comment from the *dispatched* `reviewId`,
+ * so a new comment on a different line was invisible no matter how often the
+ * agent re-read. That is what made the in-flight cap in `handleWebhook.ts` a
+ * silent loss rather than the coalescing it was documented as (#1103).
+ *
+ * `fetchAllReviewThreads` already pulls every thread on the PR and caches it for
+ * 60s, so this costs no extra round trip and a re-read mid-run picks up whatever
+ * landed behind the run.
+ *
+ * Three exclusions, each load-bearing:
+ *   - resolved threads are done, and re-opening that conversation is noise.
+ *   - a thread Pullfrog has already spoken in was handled by an earlier run.
+ *     That deliberately includes the pushbacks AddressReviews leaves open for a
+ *     human to mediate — re-addressing one re-litigates a settled disagreement —
+ *     and it is also what stops this mode replying to Pullfrog's own reviews.
+ *   - under `mentions` a concurrent thread is in scope only if it actually asked
+ *     for Pullfrog. Deliberately asymmetric with `threadsForReview`, which is
+ *     returned whole and always was: the dispatching review is the one the
+ *     server already adjudicated, and the agent needs its unmentioned threads as
+ *     context for the comment that did mention it. Which of those to ACT on stays
+ *     the mode prompt's job. A concurrent review has had no such adjudication, so
+ *     the mention is the only thing that can authorize it.
+ */
+export function concurrentThreads(
+  allThreads: (ReviewThread | null)[],
+  threadsForReview: ReviewThread[],
+  input: GetReviewDataInput
+): ReviewThread[] {
+  const alreadyIncluded = new Set(threadsForReview.map((thread) => thread.id));
+
+  return allThreads.filter((thread): thread is ReviewThread => {
+    if (!thread?.comments?.nodes || alreadyIncluded.has(thread.id)) return false;
+    if (thread.isResolved) return false;
+
+    const comments = thread.comments.nodes.filter((c): c is ReviewThreadComment => c !== null);
+    if (comments.length === 0) return false;
+    if (comments.some((c) => isPullfrog(c.author?.login))) return false;
+
+    return input.addressScope === "all" || comments.some((c) => mentionsPullfrog(c.body));
+  });
+}
+
+/**
+ * Mirrors the server-side `containsTriggerPhrase` gate that decided this run was
+ * dispatched at all: blockquoted mentions don't count, so quoting someone else's
+ * `@pullfrog` while replying doesn't pull an unrelated thread into scope. Neither
+ * does one shown in code.
+ */
+function mentionsPullfrog(body: string | null | undefined): boolean {
+  if (!body) return false;
+  const text = mentionableText(body).toLowerCase();
+  return mentionHandles().some((handle) => text.includes(handle));
 }
 
 interface GetReviewDataInput {
@@ -576,6 +696,16 @@ interface GetReviewDataInput {
   pullNumber: number;
   reviewId: number;
   approvedBy?: string | undefined;
+  /**
+   * Widen the read past the dispatching review to the other open threads on the
+   * PR — `all` on a Pullfrog-authored PR, `mentions` when only `@pullfrog`-
+   * mentioning threads are in scope. Absent (console `fix_review`, and any
+   * payload from a server build that predates the field) keeps the read scoped
+   * to the dispatching review exactly as before.
+   */
+  addressScope?: "all" | "mentions" | undefined;
+  /** whether this run can push, which is what makes a comment's author matter */
+  canPush: boolean;
   tmpdir: string;
   githubToken: string;
 }
@@ -699,7 +829,9 @@ async function fetchReviewData(
       review_id: input.reviewId,
       headers: { accept: "application/vnd.github.full+json" },
     }),
-    getReviewThreads(input),
+    getReviewThreads(input).then((threads) =>
+      input.canPush ? writerComments(input, threads) : threads
+    ),
   ]);
 
   // skip listFiles when there are no threads — prFiles is only used for
@@ -763,6 +895,12 @@ export function GetReviewCommentsTool(ctx: ToolContext) {
           ? ctx.payload.triggerer
           : undefined;
 
+      // the 60s TTL exists to collapse a burst of identical calls (#1097), which
+      // is exactly wrong for the deliberate re-read before committing: a run
+      // that reached its commit inside the window would be handed its own
+      // opening snapshot and see none of the comments it re-read for.
+      if (params.fresh) invalidateReviewThreadCache(ctx.repo);
+
       const result = await getReviewData({
         octokit: ctx.octokit,
         owner: ctx.repo.owner,
@@ -770,6 +908,8 @@ export function GetReviewCommentsTool(ctx: ToolContext) {
         pullNumber: params.pull_number,
         reviewId: params.review_id,
         approvedBy,
+        addressScope: ctx.payload.event.address_scope,
+        canPush: ctx.payload.push !== "disabled",
         tmpdir: ctx.tmpdir,
         githubToken: ctx.githubInstallationToken,
       });
@@ -808,11 +948,12 @@ export function GetReviewCommentsTool(ctx: ToolContext) {
         toc: formatted.toc,
         instructions:
           `the file at commentsPath contains ${threadBlocks.length} review threads with full conversation history. ` +
-          `comments marked with * are from the target review (${params.review_id}). ` +
+          `comments marked with * are from the target review (${params.review_id}); any other thread is open feedback ` +
+          `on this PR, including comments that landed after this run started. Being returned does not authorize a code change; follow the task's scope and each thread's latest request. ` +
           `the TOC shows each thread's file:line and the line number where it appears in the file. ` +
           `to read a specific thread, use: grep -A 50 "^## <file:line>" ${commentsPath} ` +
           `(replace <file:line> with the path from the TOC, e.g. "^## action/utils/foo.ts:42"). ` +
-          `address each thread in order, working through one file at a time.`,
+          `read each full thread before deciding whether it calls for a reply or a code change.`,
       };
     }),
   });
@@ -879,6 +1020,13 @@ export const ResolveReviewThread = type({
   thread_id: type.string.describe("The GraphQL node ID of the review thread to resolve"),
 });
 
+/** triggers where a human argues with a finding, as opposed to a review run resolving its own */
+const DISCUSSION_TRIGGERS = new Set([
+  "pull_request_review_comment_created",
+  "pull_request_review_submitted",
+  "issue_comment_created",
+]);
+
 export function ResolveReviewThreadTool(ctx: ToolContext) {
   return tool({
     name: "resolve_review_thread",
@@ -886,9 +1034,23 @@ export function ResolveReviewThreadTool(ctx: ToolContext) {
     description:
       "Mark a review thread as resolved using GitHub's GraphQL API. " +
       "Only call this after addressing the review feedback, implementing fixes, testing them, and posting a reply. " +
-      "Do not resolve threads that are already resolved, threads where no action was taken, or threads where you disagree with the feedback.",
+      "Do not resolve threads that are already resolved, threads where no action was taken (unless you are withdrawing your own finding), or threads where you disagree with the feedback.",
     parameters: ResolveReviewThread,
     execute: execute(async (params) => {
+      // resolving Pullfrog's last finding dispatches a re-review that can approve,
+      // so arguing a finding away is not something a stranger can do through us
+      if (
+        DISCUSSION_TRIGGERS.has(ctx.payload.event.trigger) &&
+        isOutsideAuthor(ctx.payload.event)
+      ) {
+        return {
+          thread_id: params.thread_id,
+          is_resolved: false,
+          success: false,
+          message:
+            "this run was started by someone without write access, so it cannot resolve review threads. reply instead and leave the thread for a maintainer.",
+        };
+      }
       try {
         const response = await ctx.octokit.graphql<{
           resolveReviewThread: {

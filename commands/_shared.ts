@@ -5,11 +5,57 @@
 import { execFileSync } from "node:child_process";
 import * as p from "@clack/prompts";
 import pc from "picocolors";
+import {
+  CLI_CONTRACT_HEADER,
+  CLI_CONTRACT_VERSION,
+  CLI_UPGRADE_MESSAGE,
+  CliContractError,
+} from "../cliContract.ts";
+import { vercelBypassSecretFor } from "../utils/vercelBypass.ts";
 
 export const PULLFROG_API_URL = (process.env.PULLFROG_API_URL || "https://pullfrog.com").replace(
   /\/+$/,
   ""
 );
+
+export const CODEX_AUTH_SECRET = "CODEX_AUTH_JSON";
+export const CLAUDE_OAUTH_SECRET = "CLAUDE_CODE_OAUTH_TOKEN";
+export const GROK_AUTH_SECRET = "GROK_AUTH_JSON";
+
+/** the credentials `pullfrog auth` mints, derived from the three above so a new provider
+ * cannot be wired into `auth` and silently miss the `secret set` guard. a repo's own copy of
+ * one takes precedence over the account's AND the chain rotates, so a stale copy dies where it
+ * sits. a static API key is deliberately not here: a repo copy shadowing one is what repo
+ * scope is for. */
+export const SUBSCRIPTION_SECRET_NAMES = [CODEX_AUTH_SECRET, CLAUDE_OAUTH_SECRET, GROK_AUTH_SECRET];
+
+/** the refusal an account-level save earns while repos hold their own copy of `name`, or null
+ * when none do. `auth` and `secret set` are two doors to the same write, so they share one
+ * message — and it carries the commands rather than running them, because deleting a stored
+ * credential is the owner's call. `overrides` is empty for a repo target, so this self-scopes. */
+export function shadowRefusal(params: {
+  overrides: { name: string; repo: string }[];
+  owner: string;
+  name: string;
+}): string | null {
+  const repos = params.overrides
+    .filter((override) => override.name === params.name)
+    .map((override) => `${params.owner}/${override.repo}`);
+  if (!repos.length) return null;
+  const bin = process.env.PULLFROG_BIN_NAME || "pullfrog";
+  return [
+    `${pc.cyan(params.name)} is already set on ${repos.map((repo) => pc.cyan(repo)).join(", ")}.`,
+    `a repo's own copy takes precedence, so saving to ${pc.cyan(params.owner)} would not change`,
+    `what runs there read.`,
+    ``,
+    `delete the repo copies, then run this command again:`,
+    ...repos.map(
+      (repo) => `  ${pc.cyan(`npx ${bin} secret delete ${params.name} --repo ${repo}`)}`
+    ),
+    ``,
+    `${pc.dim("or:")} pass ${pc.cyan("--repo OWNER/REPO")} to replace one repo's own copy instead.`,
+  ].join("\n");
+}
 
 // active spinner reference so bail/cancel can stop it before exiting. shared
 // across init/auth subcommands via this module's singleton scope; whichever
@@ -29,7 +75,7 @@ export function bail(msg: string): never {
   process.exit(1);
 }
 
-export function handleCancel<T>(value: T | symbol): asserts value is T {
+export function handleCancel<T>(value: T): asserts value is Exclude<T, symbol> {
   if (p.isCancel(value)) {
     if (activeSpin) {
       activeSpin.stop(pc.red("canceled."));
@@ -40,37 +86,53 @@ export function handleCancel<T>(value: T | symbol): asserts value is T {
   }
 }
 
-export function getGhToken(): string {
-  let token: string;
+/** the gh token, or null when the cli is missing, unauthenticated, or silent.
+ * the non-exiting half of `getGhToken` — `pullfrog mcp` speaks JSON-RPC over
+ * stdout, so it cannot use a helper that exits through clack (which prints
+ * there and would corrupt the stream). */
+export function tryGetGhToken(): string | null {
   try {
-    token = execFileSync("gh", ["auth", "token"], { encoding: "utf-8" }).trim();
+    return execFileSync("gh", ["auth", "token"], { encoding: "utf-8" }).trim() || null;
   } catch {
-    bail(
-      `gh cli not found or not authenticated.\n` +
-        `  ${pc.dim("install:")} https://cli.github.com\n` +
-        `  ${pc.dim("then:")}    gh auth login`
-    );
+    return null;
   }
+}
+
+export const GH_TOKEN_HELP =
+  "gh cli not found or not authenticated. install https://cli.github.com, then run `gh auth login`.";
+
+export function getGhToken(): string {
+  const token = tryGetGhToken();
   if (!token) {
     bail(
-      `gh cli returned an empty token. try re-authenticating:\n` +
-        `  ${pc.dim("run:")} gh auth login`
+      `gh cli not found, not authenticated, or returned an empty token.\n` +
+        `  ${pc.dim("install:")} https://cli.github.com\n` +
+        `  ${pc.dim("then:")}    gh auth login`
     );
   }
   return token;
 }
 
-export function parseGitRemote(): { owner: string; repo: string } {
+/** owner/repo from the `origin` remote, or null when there isn't one we can
+ * parse. non-exiting twin of `parseGitRemote`, for the same stdout reason. */
+export function tryParseGitRemote(): { owner: string; repo: string } | null {
   let url: string;
   try {
     url = execFileSync("git", ["remote", "get-url", "origin"], { encoding: "utf-8" }).trim();
   } catch {
-    bail("not a git repository or no 'origin' remote found.");
+    return null;
   }
-
   const match = url.match(/github\.com(?::\d+)?[:/]+([^/]+)\/(.+?)(?:\.git)?(?:\/)?$/);
-  if (!match) bail(`could not parse github owner/repo from remote: ${url}`);
+  if (!match) return null;
   return { owner: match[1], repo: match[2] };
+}
+
+export function parseGitRemote(): { owner: string; repo: string } {
+  const parsed = tryParseGitRemote();
+  if (!parsed) {
+    bail("not a git repository, no 'origin' remote, or the remote is not a github url.");
+  }
+  return parsed;
 }
 
 // ── Pullfrog API ──
@@ -118,13 +180,18 @@ type ApiResult<T = Record<string, unknown>> = {
   data: T;
 };
 
-async function pullfrogApi<T = Record<string, unknown>>(ctx: {
+export async function pullfrogApi<T = Record<string, unknown>>(ctx: {
   path: string;
   token: string;
-  method?: string;
-  body?: Record<string, unknown>;
+  method?: string | undefined;
+  body?: object | undefined;
 }): Promise<ApiResult<T>> {
-  const headers: Record<string, string> = { authorization: `Bearer ${ctx.token}` };
+  const headers: Record<string, string> = {
+    authorization: `Bearer ${ctx.token}`,
+    [CLI_CONTRACT_HEADER]: CLI_CONTRACT_VERSION,
+  };
+  const bypassSecret = vercelBypassSecretFor(new URL(PULLFROG_API_URL));
+  if (bypassSecret) headers["x-vercel-protection-bypass"] = bypassSecret;
   if (ctx.body) headers["content-type"] = "application/json";
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 30_000);
@@ -135,6 +202,7 @@ async function pullfrogApi<T = Record<string, unknown>>(ctx: {
       body: ctx.body ? JSON.stringify(ctx.body) : null,
       signal: controller.signal,
     });
+    if (response.status === 426) throw new CliContractError(CLI_UPGRADE_MESSAGE);
     const data = (await response.json().catch(() => ({}))) as T;
     return { ok: response.ok, status: response.status, data };
   } finally {

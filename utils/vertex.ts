@@ -3,6 +3,7 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { VERTEX_MODEL_ID_ENV } from "../models.ts";
+import { maskSecret } from "./secretCommands.ts";
 
 export const VERTEX_SERVICE_ACCOUNT_JSON_ENV = "VERTEX_SERVICE_ACCOUNT_JSON";
 export const GOOGLE_APPLICATION_CREDENTIALS_ENV = "GOOGLE_APPLICATION_CREDENTIALS";
@@ -54,6 +55,8 @@ export function materializeVertexCredentials(params: {
 
   const blob = process.env[VERTEX_SERVICE_ACCOUNT_JSON_ENV];
   if (!blob) return undefined;
+  // a workflow `env:` value is masked only when its name ends in a sensitive suffix, and `_JSON` doesn't
+  maskSecret(blob);
 
   const secretDir = createSecretDir();
   const credentialsPath = join(secretDir, "vertex-sa.json");

@@ -1,5 +1,5 @@
 /**
- * Pure-stdlib (fetch + Buffer) Codex OAuth refresh + JWT exp decoding.
+ * Pure-stdlib (fetch) Codex OAuth refresh.
  *
  * Lives here (not in codexAuth.ts) so the Next.js server side can import it
  * via pullfrog/internal without dragging in node:child_process / spawn /
@@ -9,6 +9,13 @@
  *
  * See wiki/codex-auth.md for the end-to-end refresh lifecycle.
  */
+
+// `decodeJwtExpMs` + `OAuthInvalidGrantError` moved to ./oauthShared.ts when
+// the Grok chain landed — both providers need them. re-exported so importers
+// (pullfrog/internal, codexHome, codexSecretRotation) keep working.
+import { decodeJwtExpMs, OAuthInvalidGrantError, parseOAuthErrorBody } from "./oauthShared.ts";
+
+export { decodeJwtExpMs, OAuthInvalidGrantError };
 
 export interface CodexAuthBody {
   auth_mode: "chatgpt";
@@ -20,8 +27,9 @@ export interface CodexAuthBody {
   };
   last_refresh?: string;
   /**
-   * ISO timestamp of an `invalid_grant` rejection. OpenAI rotates the refresh
-   * token on every use, so a rejection is PERMANENT — without a latch the
+   * ISO timestamp of a rejection OpenAI attributed to the token itself (a `401`
+   * other than `invalid_client` — see `codexChainIsDead`). OpenAI rotates the refresh
+   * token on every use, so such a rejection is PERMANENT — without a latch the
    * server re-issued the identical doomed refresh on every run (455 futile
    * round trips in 7 days, one per run, each holding a Postgres row lock across
    * a 10s external call). Cleared implicitly: `pullfrog auth codex` and
@@ -33,7 +41,7 @@ export interface CodexAuthBody {
 }
 
 /** OAuth client id Codex CLI and OpenCode both use against `auth.openai.com`.
- * Same chain — a refresh token minted via `codex login --device-auth` can be
+ * Same chain — a refresh token minted via `codex login` can be
  * refreshed against this client_id. */
 export const CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 export const CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token";
@@ -45,16 +53,16 @@ interface OAuthTokenResponse {
   expires_in?: number;
 }
 
-/** thrown when the OAuth provider rejects the refresh token (4xx). callers
- * can distinguish "race-lost / token revoked" from network errors via
- * `instanceof OAuthInvalidGrantError`. */
-export class OAuthInvalidGrantError extends Error {
-  public readonly status: number;
-  constructor(status: number, body: string) {
-    super(`Codex token refresh failed: ${status} ${body}`);
-    this.name = "OAuthInvalidGrantError";
-    this.status = status;
-  }
+/** OpenAI does NOT answer RFC 6749 codes here: `error` is an OBJECT, when there is a body at
+ * all. Measured with negative controls, a spent refresh answers `401 code:"token_expired"`, a
+ * bad `grant_type` `400 code: null` and an unknown client `401 code:"invalid_client"` — but the
+ * chains production latched answered `401` with an EMPTY body, so keying on `token_expired`
+ * never fired the latch (#1101). A `401` is dead unless it blames our client id — codex-rs latches
+ * every `401` with no such carve-out, so this is the stricter of the two. */
+function codexChainIsDead(status: number, body: string): boolean {
+  if (status !== 401) return false;
+  const err = parseOAuthErrorBody(body)?.error;
+  return !(err && typeof err === "object" && "code" in err && err.code === "invalid_client");
 }
 
 /** force one refresh round-trip against the OAuth provider. returns the
@@ -82,7 +90,12 @@ export async function refreshCodexAuthBody(body: CodexAuthBody): Promise<CodexAu
   if (!response.ok) {
     const text = await response.text().catch(() => "");
     if (response.status >= 400 && response.status < 500) {
-      throw new OAuthInvalidGrantError(response.status, text);
+      throw new OAuthInvalidGrantError(
+        "Codex",
+        response.status,
+        text,
+        codexChainIsDead(response.status, text)
+      );
     }
     throw new Error(`Codex token refresh failed: ${response.status} ${text}`);
   }
@@ -99,28 +112,6 @@ export async function refreshCodexAuthBody(body: CodexAuthBody): Promise<CodexAu
     },
     last_refresh: new Date().toISOString(),
   };
-}
-
-/** decode the access_token's JWT payload and return its `exp` claim in ms
- * since epoch. returns null if the token isn't a parseable JWT or has no
- * `exp` claim — caller falls back to "treat as expired".
- *
- * We don't verify the JWT signature (we'd need OpenAI's JWKS); we're only
- * using the claim as a freshness hint. The actual auth check happens
- * server-side at OpenAI when the token is used — trusting a fake JWT here
- * would just delay the inevitable 401 from OpenAI. No security boundary
- * at this decode step. */
-export function decodeJwtExpMs(token: string): number | null {
-  const parts = token.split(".");
-  if (parts.length !== 3) return null;
-  let payload: { exp?: unknown };
-  try {
-    payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
-  } catch {
-    return null;
-  }
-  if (typeof payload.exp !== "number" || !Number.isFinite(payload.exp)) return null;
-  return payload.exp * 1000;
 }
 
 /** parse + validate a Codex auth.json body from its JSON-string form.

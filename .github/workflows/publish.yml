@@ -1,25 +1,67 @@
 name: Publish & Release
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - "package.json"
+  # dispatch only, and deliberately so. a `workflow_dispatch` needs a GitHub session or token
+  # carrying write access; a stolen git push credential carries neither, so it can no longer start a
+  # release by landing a commit. that is the shape of the 2026-09-21 nubjs/nub compromise, where a
+  # stolen push credential cut a tag and 18 packages published unattended. bumping the version in
+  # package.json is therefore inert until a maintainer runs `gh workflow run publish.yml -R
+  # pullfrog/pullfrog -f notes="$(cat notes.md)"`, and the staged version then still needs their 2FA
+  # approval before npm serves it.
+  #
+  # two jobs. `stage` puts the version in npm's staged queue. `finish` runs on the `release-approval`
+  # environment, whose required reviewers are the npm maintainers: GitHub holds the run there, with no
+  # runner, for up to 30 days. the npm approval is the gate; the environment approval only resumes the
+  # run, and `finish` checks the registry before it tags or releases anything. `stager`, run by the
+  # maintainer with one authenticator code, does both, approving on npm and then resuming the run.
+  #
+  # only `finish` can write a tag. the "Release tags" ruleset refuses tag creation, moves and deletions
+  # to everyone, admins and workflow tokens included, except deploy keys; the one deploy key is the
+  # `RELEASE_TAG_KEY` secret on `release-approval`, so neither a version tag nor `v0` moves until a
+  # maintainer approved the run.
+  #
+  # everything the release needs is given at dispatch: the commit is the one dispatched, the version
+  # comes from its package.json, and the release notes are the required `notes` input. a run's inputs
+  # are fixed for its whole life, so the notes survive the approval wait and any re-run of a job.
   workflow_dispatch:
+    inputs:
+      notes:
+        description: 'Release notes in Markdown, the body of the GitHub release. Pass a file with -f notes="$(cat notes.md)".'
+        type: string
+        required: true
 
-permissions:
-  contents: write
-  id-token: write
+permissions: {}
 
 jobs:
-  publish:
+  stage:
     runs-on: ubuntu-latest
+    # this job only builds and stages; the wait for the approval is `finish`, which holds no runner until it is approved
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
+      # a step, not a job-level `if:`: a skipped job is silent, and the run would go
+      # green having released nothing while looking like it had.
+      - name: Refuse to release from any ref but main
+        run: |
+          [ "$GITHUB_REF" = "refs/heads/main" ] || { echo "::error::publish.yml runs from main only, got $GITHUB_REF"; exit 1; }
+
+      - name: Refuse a release without notes
+        env:
+          NOTES: ${{ inputs.notes }}
+        run: |
+          [ -n "$(printf '%s' "$NOTES" | tr -d '[:space:]')" ] || { echo "::error::the notes input is empty: gh workflow run publish.yml -R $GITHUB_REPOSITORY -f notes=\"\$(cat notes.md)\""; exit 1; }
+
+      # the dispatched commit, which `finish` tags: the deploy key it pushes with is not held to the
+      # job token's rule that a pushed ref's `.github/workflows/` match a branch tip, so a mirror
+      # commit landing after the dispatch no longer strands the tag (0.1.66).
       - name: Checkout code
         uses: actions/checkout@v6
         with:
-          fetch-depth: 0
+          persist-credentials: false
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -30,6 +72,16 @@ jobs:
           node-version: "24"
           cache: "pnpm"
           registry-url: "https://registry.npmjs.org"
+
+      # `npm stage publish` landed in npm 11.15, and the npm bundled with Node 24 lags it.
+      - name: Install an npm CLI that can stage
+        run: | # zizmor: ignore[adhoc-packages] the npm CLI itself, pinned to the major that carries `npm stage`
+          npm install -g npm@11
+          v="$(npm --version)"
+          # `sort -V | head -1` yields the smaller of the two; it must be the floor.
+          [ "$(printf '%s\n11.15.0\n' "$v" | sort -V | head -1)" = "11.15.0" ] \
+            || { echo "::error::npm $v cannot stage (need >= 11.15)"; exit 1; }
+          echo "npm $v"
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -42,82 +94,175 @@ jobs:
         run: |
           VERSION=$(npm pkg get version | tr -d '"')
           echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "tag=v$VERSION" >> $GITHUB_OUTPUT
+          echo "📦 package version: $VERSION"
 
-          # Extract major version (e.g., "0" from "0.0.1")
-          MAJOR_VERSION=$(echo $VERSION | cut -d. -f1)
-          echo "major_tag=v$MAJOR_VERSION" >> $GITHUB_OUTPUT
-
-          echo "📦 Package version: $VERSION"
-
-      - name: Check if tag already exists
-        id: check_tag
+      # the guard asks npm, not git. gating on "does the tag exist" made a half-finished
+      # release unrecoverable: the tag is pushed by this same job, so any later failure
+      # left a re-run seeing its own tag and skipping the publish it still owed.
+      #
+      # every registry read here and below hits the registry URL directly rather than
+      # going through `npm view`, which revalidates a cached packument and so reports a
+      # live version as missing for minutes. That ambiguity is what made a slow read
+      # indistinguishable from a stalled publish while 0.1.66 and 0.1.72 were diagnosed.
+      - name: Check whether npm already serves this version
+        id: check_npm
         run: |
-          if git rev-parse "refs/tags/${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
-            echo "exists=true" >> $GITHUB_OUTPUT
-            echo "⚠️ Tag ${{ steps.version.outputs.tag }} already exists - skipping release"
+          if curl -sf "https://registry.npmjs.org/pullfrog/${{ steps.version.outputs.version }}" > /dev/null; then
+            echo "published=true" >> $GITHUB_OUTPUT
+            echo "ℹ️ npm already serves ${{ steps.version.outputs.version }} - skipping the staging step"
           else
-            echo "exists=false" >> $GITHUB_OUTPUT
-            echo "✅ Tag ${{ steps.version.outputs.tag }} does not exist - will create release"
+            echo "published=false" >> $GITHUB_OUTPUT
+            echo "✅ ${{ steps.version.outputs.version }} is not on npm yet - will stage it"
           fi
 
-      - name: Create and push tags
-        if: steps.check_tag.outputs.exists == 'false'
-        run: |
-          # Create specific version tag
-          git tag ${{ steps.version.outputs.tag }}
-          git push origin ${{ steps.version.outputs.tag }}
-
-          # Create/update major version tag (moving tag)
-          git tag -f ${{ steps.version.outputs.major_tag }}
-          git push origin ${{ steps.version.outputs.major_tag }} --force
-
-          echo "🏷️ Created tags: ${{ steps.version.outputs.tag }} and ${{ steps.version.outputs.major_tag }}"
-
-      - name: Create GitHub Release
-        if: steps.check_tag.outputs.exists == 'false'
-        uses: actions/create-release@v1
+      # this stages, it does not publish. the trusted publisher for `pullfrog` is
+      # stage-only, so a run can put a version in npm's staged queue and nothing else; a
+      # maintainer then approves it with 2FA, which is a proof of presence no stolen
+      # credential can supply. `finish` is what observes that approval.
+      #
+      # `continue-on-error` came off with the token-era publish it protected: staging must
+      # fail loudly. the one refusal it existed for is now handled in line — npm reserves
+      # the version number while it is staged, so a re-run before the approval is refused,
+      # and that refusal is success here (0.1.71 died on exactly it and left `v0` two
+      # versions behind for 19h). the wording is matched loosely because the first
+      # stage-only release is where it gets observed; anything else is fatal.
+      - name: Stage the release on npm
+        id: stage
+        if: steps.check_npm.outputs.published == 'false'
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          release_name: "${{ steps.version.outputs.tag }}"
-          body: |
-            ## 📦 pullfrog ${{ steps.version.outputs.version }}
-
-            ### Usage in GitHub Actions
-
-            ```yaml
-            - uses: pullfrog/pullfrog@${{ steps.version.outputs.major_tag }}
-            ```
-
-            ### Installation via npm
-
-            ```bash
-            npm install pullfrog@${{ steps.version.outputs.version }}
-            ```
-          draft: false
-          prerelease: false
-
-      - name: Publish to npm
-        if: steps.check_tag.outputs.exists == 'false'
-        run: npm publish --provenance --access public
-
-      - name: Summary
-        if: always()
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          echo "## 📊 Publish Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          if [[ "${{ steps.check_tag.outputs.exists }}" == "true" ]]; then
-            echo "⚠️ Version ${{ steps.version.outputs.version }} already exists - no action taken" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "✅ Successfully published version ${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "### 🏷️ Tags Created" >> $GITHUB_STEP_SUMMARY
-            echo "- \`${{ steps.version.outputs.tag }}\` (specific version)" >> $GITHUB_STEP_SUMMARY
-            echo "- \`${{ steps.version.outputs.major_tag }}\` (major version, auto-updating)" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "### 📦 Published to" >> $GITHUB_STEP_SUMMARY
-            echo "- GitHub Release: [View Release](https://github.com/${{ github.repository }}/releases/tag/${{ steps.version.outputs.tag }})" >> $GITHUB_STEP_SUMMARY
-            echo "- npm Registry: [pullfrog@${{ steps.version.outputs.version }}](https://www.npmjs.com/package/pullfrog/v/${{ steps.version.outputs.version }})" >> $GITHUB_STEP_SUMMARY
+          set -euo pipefail
+          out="$(mktemp)"
+          if npm stage publish --provenance --access public >"$out" 2>&1; then
+            cat "$out"
+            exit 0
           fi
+          cat "$out"
+          if grep -qiE 'already (been )?staged|staged version|E409|EPUBLISHCONFLICT|previously published' "$out"; then
+            echo "ℹ️ $VERSION is already staged or published - the approval decides the rest"
+            exit 0
+          fi
+          echo "::error::staging $VERSION failed"
+          exit 1
+
+      # its own step, teed to the log: a step summary reaches the job view only when its step
+      # ends and the run page only when the job does, so written inside the wait below these
+      # commands stayed unreadable for the whole window they exist to serve.
+      - name: Post the approval commands
+        if: steps.check_npm.outputs.published == 'false'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          NOTES: ${{ inputs.notes }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          {
+            echo "## Staged on npm - waiting for approval"
+            echo
+            echo "\`pullfrog@$VERSION\` is staged and is not installable until a maintainer approves it with 2FA. This run is now held on the \`release-approval\` environment, with no runner, for up to 30 days. No tag moves and no release is created until it resumes and npm serves the version."
+            echo
+            echo '```'
+            echo "stager   # in your own terminal: a, Enter, then one authenticator code approves it and resumes this run"
+            echo "stager reject 'pullfrog@$VERSION'    # drop the staged version and fail this run"
+            echo '```'
+            echo
+            echo "Without stager: \`npm stage list pullfrog\` prints the stage id, \`npm stage approve <id>\` approves it (or the Staged Packages tab on npmjs.com), and then approve the pending \`release-approval\` deployment on $RUN_URL."
+            echo
+            echo "## Release notes"
+            echo
+            printf '%s\n' "$NOTES"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+  finish:
+    needs: stage
+    # held by the environment's required reviewers, not by a runner: GitHub keeps the run waiting for up
+    # to 30 days, with no six-hour cap, until the deployment is approved. it is a resume signal only; a
+    # version nobody approved on npm still stops this job at the registry check.
+    environment: release-approval
+    runs-on: ubuntu-latest
+    # 6h is GitHub's hard cap for a hosted runner; the wait takes 340 minutes of it and the steps after it need a few
+    timeout-minutes: 360
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.stage.outputs.version }}
+      TAG: v${{ needs.stage.outputs.version }}
+    steps:
+      # the release invariant: the major tag must never advance past what npm actually
+      # serves, because the action bakes `pullfrog@^<own version>` into its npx spec, so
+      # a major tag ahead of npm is ETARGET on every consumer run. confirm rather than
+      # assume before any tag moves.
+      #
+      # the run resumes on the environment approval, which says nothing about npm, so this
+      # loop is the human gate; it also absorbs the automated review npm runs once a version
+      # is approved (measured here: 0.1.70 sat 3.5 minutes, 0.1.71 ~54, 0.1.72 236; zod sees
+      # 16, 25, 116). past it the step fails rather than the job timing out, so the log says
+      # what to do: approve, then re-run.
+      - name: Wait for npm to serve the version
+        run: |
+          for i in $(seq 1 340); do
+            if curl -sf "https://registry.npmjs.org/pullfrog/$VERSION" > /dev/null; then
+              echo "✅ npm is serving $VERSION (after $i min)"
+              exit 0
+            fi
+            if [ $((i % 15)) -eq 0 ]; then
+              echo "waiting for the staged $VERSION to be approved and served ($i minutes)"
+            fi
+            sleep 60
+          done
+          echo "::error::npm never served $VERSION in 340min; refusing to tag. approve it by running stager in a terminal, then re-run this job"
+          exit 1
+
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      # the job token cannot write a tag, so both are pushed with the deploy key the ruleset exempts
+      - name: Tag the release and move the major tag
+        env:
+          RELEASE_TAG_KEY: ${{ secrets.RELEASE_TAG_KEY }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$RELEASE_TAG_KEY" > "$RUNNER_TEMP/release-tag-key"
+          chmod 600 "$RUNNER_TEMP/release-tag-key"
+          echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > "$RUNNER_TEMP/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $RUNNER_TEMP/release-tag-key -o IdentitiesOnly=yes -o UserKnownHostsFile=$RUNNER_TEMP/known_hosts"
+          remote="git@github.com:$GITHUB_REPOSITORY.git"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" > /dev/null; then
+            echo "🏷️ $TAG already exists"
+          else
+            git push "$remote" "$GITHUB_SHA:refs/tags/$TAG"
+            echo "🏷️ created $TAG"
+          fi
+
+          # a re-run after a late approval must not drag the major tag back: when two staged
+          # versions are approved together, only the one npm calls `latest` may own it.
+          major="v${VERSION%%.*}"
+          latest="$(curl -sf https://registry.npmjs.org/-/package/pullfrog/dist-tags | jq -r .latest)"
+          if [ "$latest" != "$VERSION" ]; then
+            echo "🏷️ npm latest is $latest, so $major stays where it is"
+            exit 0
+          fi
+          # the version tag's own commit, which differs from this run's on a re-dispatch of a version already tagged
+          git fetch --quiet origin "refs/tags/$TAG"
+          git push --force "$remote" "$(git rev-parse 'FETCH_HEAD^{commit}'):refs/tags/$major"
+          echo "🏷️ moved $major to $VERSION"
+
+      # last, and deliberately so: this is the only cosmetic step, and it is the one that
+      # failed on 0.1.58. from here its failure costs a re-run, never a consumer outage.
+      # the notes go through env and a file so their text can't break out of the command; a
+      # re-dispatch with corrected notes rewrites an existing release's body.
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NOTES: ${{ inputs.notes }}
+        run: |
+          printf '%s\n' "$NOTES" > "$RUNNER_TEMP/release-notes.md"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file "$RUNNER_TEMP/release-notes.md"
+            echo "📝 release $TAG already existed; its notes are rewritten from this dispatch"
+            exit 0
+          fi
+          gh release create "$TAG" --verify-tag --title "$TAG" --notes-file "$RUNNER_TEMP/release-notes.md"

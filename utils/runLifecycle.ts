@@ -98,6 +98,9 @@ export async function finalizeSuccessRun(input: {
         repo: input.repo,
         agentDiagnostic: input.toolState.agentDiagnostic,
         routerActive: !!input.toolContext.payload.proxyModel,
+        model: input.toolState.model,
+        credential: input.toolState.credential,
+        trial: input.toolState.modelClamped?.reason === "trial",
       })
     : null;
 

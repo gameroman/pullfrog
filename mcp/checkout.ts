@@ -3,15 +3,21 @@ import { statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Octokit, RestEndpointMethodTypes } from "@octokit/rest";
 import { type } from "arktype";
+import * as yes from "yes";
 import { primaryRepoState, type RepoToolState, requireRepoState } from "../toolState.ts";
 import { createChangeImpactArtifact } from "../utils/changeImpact.ts";
 import { log } from "../utils/cli.ts";
-import { countLines, createDiffCoverageState } from "../utils/diffCoverage.ts";
+import {
+  countLines,
+  createDiffCoverageState,
+  parseDiffTocEntries,
+  parseIncrementalDiffEntries,
+} from "../utils/diffCoverage.ts";
+import { GENERATED } from "../utils/generatedFiles.ts";
 import { $git, $gitFetchWithDeepen, DEEPEN_RETRY_DEPTH } from "../utils/gitAuth.ts";
 import { executeLifecycleHook } from "../utils/lifecycle.ts";
 import { computeIncrementalDiff } from "../utils/rangeDiff.ts";
 import { $ } from "../utils/shell.ts";
-import * as yes from "../yes/index.ts";
 import { rejectIfLeadingDash } from "./git.ts";
 import { commentableLinesForFile } from "./review.ts";
 import type { ToolContext } from "./server.ts";
@@ -122,8 +128,9 @@ export function formatFilesWithLineNumbers(files: PullFile[]): FormatFilesResult
   const tocLines = [`## Files (${files.length})`];
   for (const entry of tocEntries) {
     const anchor = createHash("sha256").update(entry.filename).digest("hex");
+    const generated = GENERATED.test(entry.filename) ? " · generated" : "";
     tocLines.push(
-      `- ${entry.filename} → lines ${entry.startLine}-${entry.endLine} · diff-${anchor}`
+      `- ${entry.filename} → lines ${entry.startLine}-${entry.endLine} · diff-${anchor}${generated}`
     );
   }
   tocLines.push("");
@@ -208,6 +215,8 @@ type EnsureBeforeShaParams = {
   gitToken: string;
   refreshGitToken?: ((stale: string) => Promise<string>) | undefined;
   isShallow: boolean;
+  isFork: boolean;
+  signal: AbortSignal;
 };
 
 type CreateTempBranchParams = {
@@ -252,6 +261,9 @@ async function ensureBeforeShaReachable(params: EnsureBeforeShaParams): Promise<
   } catch {
     // not available locally — create a temporary branch to fetch it
   }
+  // never for a fork: a base-repo branch at the fork's commit runs that code in the base
+  // repo's push workflows, with its secrets
+  if (params.isFork) return false;
 
   const tempBranch = `pullfrog/tmp/${params.sha.slice(0, 12)}`;
   try {
@@ -277,7 +289,7 @@ async function ensureBeforeShaReachable(params: EnsureBeforeShaParams): Promise<
         "origin",
         tempBranch,
       ],
-      { token: params.gitToken, refreshGitToken: params.refreshGitToken },
+      { token: params.gitToken, refreshGitToken: params.refreshGitToken, signal: params.signal },
       `before_sha temp branch ${tempBranch}`
     );
     log.debug(`» fetched before_sha via temp branch ${tempBranch}`);
@@ -305,6 +317,8 @@ function hasLocalCommit(sha: string | undefined): boolean {
 
 type CheckoutPrBranchParams = GitContext & {
   beforeSha?: string | undefined;
+  /** aborts the in-flight fetch (SIGTERM, so git removes its own locks) when the tool deadline fires */
+  signal: AbortSignal;
 };
 
 // stale lock files left over from a crashed/cancelled prior git process block
@@ -334,7 +348,9 @@ function cleanupStaleGitLocks(): void {
     } catch {
       continue;
     }
-    if (now - mtimeMs < STALE_LOCK_AGE_MS) continue;
+    // a lock created after this process started belongs to one of this run's own git
+    // processes (an agent `git_fetch`, or an attempt the deadline is still cancelling).
+    if (now - mtimeMs < STALE_LOCK_AGE_MS || mtimeMs >= performance.timeOrigin) continue;
     try {
       unlinkSync(relPath);
       log.warning(`» removed stale ${relPath} from prior run`);
@@ -411,7 +427,7 @@ export async function checkoutPrBranch(
   pr: PrData,
   params: CheckoutPrBranchParams
 ): Promise<{ hookWarning?: string | undefined }> {
-  const { octokit, owner, name, gitToken, refreshGitToken, toolState, beforeSha } = params;
+  const { octokit, owner, name, gitToken, refreshGitToken, toolState, beforeSha, signal } = params;
 
   // SECURITY: PR ref names come from GitHub and are attacker-controlled on
   // forks (the PR author picks headRef freely, and baseRef could be a
@@ -455,7 +471,7 @@ export async function checkoutPrBranch(
   log.debug(`» fetching base branch (${pr.baseRef})...`);
   await $gitFetchWithDeepen(
     ["--no-tags", "origin", pr.baseRef],
-    { token: gitToken, refreshGitToken },
+    { token: gitToken, refreshGitToken, signal },
     `base branch ${pr.baseRef}`
   );
 
@@ -478,12 +494,12 @@ export async function checkoutPrBranch(
     //   - pull/N/head webhook race (`couldn't find remote ref pull/N/head`) —
     //     handled by the outer retry below (see issue #591)
     log.debug(`» fetching PR #${pr.number} (${localBranch})...`);
-    await yes.op(
-      async () => {
+    await yes.mutation({
+      run: async () => {
         try {
           await $gitFetchWithDeepen(
             ["--no-tags", "origin", `+pull/${pr.number}/head:${localBranch}`],
-            { token: gitToken, refreshGitToken },
+            { token: gitToken, refreshGitToken, signal },
             `PR #${pr.number}`
           );
         } catch (e) {
@@ -498,12 +514,12 @@ export async function checkoutPrBranch(
           throw e;
         }
       },
-      {
-        retries: PULL_REF_RETRY_DELAYS_MS,
-        name: `pull/${pr.number}/head fetch`,
-        bail: (e) => !PULL_REF_MISSING_PATTERN.test(e instanceof Error ? e.message : String(e)),
-      }
-    )();
+      retry: (error, attempt) =>
+        PULL_REF_MISSING_PATTERN.test(error instanceof Error ? error.message : String(error))
+          ? yes.backoff(PULL_REF_RETRY_DELAYS_MS, attempt)
+          : -1,
+      name: `pull/${pr.number}/head fetch`,
+    })();
 
     // checkout the branch
     $("git", ["checkout", localBranch], { log: false });
@@ -521,6 +537,8 @@ export async function checkoutPrBranch(
         gitToken,
         refreshGitToken,
         isShallow,
+        isFork,
+        signal,
       })
     : false;
 
@@ -574,6 +592,7 @@ export async function checkoutPrBranch(
       log.debug(`» deepening by ${deepenDepth} to reach merge base...`);
       await $git("fetch", [`--deepen=${deepenDepth}`, "--no-tags", "origin"], {
         token: gitToken,
+        signal,
       });
     }
   }
@@ -595,6 +614,13 @@ export async function checkoutPrBranch(
       $("git", ["remote", "set-url", remoteName, forkUrl], { log: false });
       log.debug(`» updated remote '${remoteName}' for fork ${pr.headRepoFullName}`);
     }
+
+    // url.*.pushInsteadOf matches by URL prefix rather than remote name, so a runner-wide
+    // rewrite reaches a remote we just created. pin this one the same way configureRepoGit
+    // pins origin.
+    $("git", ["config", "--local", "--replace-all", `remote.${remoteName}.pushurl`, forkUrl], {
+      log: false,
+    });
 
     // set branch push config so `git push` knows where to push
     $("git", ["config", `branch.${localBranch}.pushRemote`, remoteName], { log: false });
@@ -630,12 +656,16 @@ export async function checkoutPrBranch(
     localBranch,
   };
 
+  // the hook ignores the signal, so never start it past the deadline (an abort swallowed by
+  // `ensureBeforeShaReachable` reaches here with no `$git` call left to surface it)
+  signal.throwIfAborted();
   // execute post-checkout lifecycle hook. soft-fail: surface the warning
   // to the agent via the tool response instead of throwing, so a flaky or
   // slightly-broken hook doesn't block checkout entirely.
   const postCheckoutHook = await executeLifecycleHook({
     event: "post-checkout",
     script: params.postCheckoutScript,
+    shell: params.shell,
     normalizeWorkingTreeAfter: true,
   });
   return { hookWarning: postCheckoutHook.warning };
@@ -661,26 +691,42 @@ const inFlightCheckouts = new Map<number, Promise<CheckoutPrResult>>();
  * work had finished 35 minutes earlier (#1171). Racing here settles the promise
  * the `finally` is waiting on, so the entry always clears and a retry gets a
  * real attempt.
+ *
+ * The deadline also ABORTS the attempt: racing alone left its git child running,
+ * and the retry's lock sweep then deleted that orphan's live `shallow.lock` (#1468).
+ * The race stays as a backstop for awaits the signal cannot reach (Octokit, the hook).
  */
 const CHECKOUT_DEADLINE_MS = 570_000;
+/** covers the 5s SIGKILL escalation and a ≤10s pull-ref retry wait; 585s stays under fastmcp's 600s */
+const CHECKOUT_ABORT_GRACE_MS = 15_000;
 
 function withCheckoutDeadline(
-  promise: Promise<CheckoutPrResult>,
+  run: (signal: AbortSignal) => Promise<CheckoutPrResult>,
   pullNumber: number
 ): Promise<CheckoutPrResult> {
-  let timer: NodeJS.Timeout | undefined;
-  const deadline = new Promise<never>((_, reject) => {
-    timer = setTimeout(
+  const exceeded = `checkout_pr #${pullNumber} exceeded ${CHECKOUT_DEADLINE_MS / 1000}s`;
+  const retry = "retry the call to start a fresh attempt.";
+  const controller = new AbortController();
+  const abortTimer = setTimeout(
+    () => controller.abort(new Error(`${exceeded} and was cancelled; ${retry}`)),
+    CHECKOUT_DEADLINE_MS
+  );
+  let backstopTimer: NodeJS.Timeout | undefined;
+  const backstop = new Promise<never>((_, reject) => {
+    backstopTimer = setTimeout(
       () =>
         reject(
           new Error(
-            `checkout_pr #${pullNumber} exceeded ${CHECKOUT_DEADLINE_MS / 1000}s. the fetch may still be running in the background; retry the call to start a fresh attempt.`
+            `${exceeded} and was asked to cancel, but a step that cannot be interrupted (the post-checkout hook or a GitHub API call) was still running ${CHECKOUT_ABORT_GRACE_MS / 1000}s later. ${retry}`
           )
         ),
-      CHECKOUT_DEADLINE_MS
+      CHECKOUT_DEADLINE_MS + CHECKOUT_ABORT_GRACE_MS
     );
   });
-  return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
+  return Promise.race([run(controller.signal), backstop]).finally(() => {
+    clearTimeout(abortTimer);
+    clearTimeout(backstopTimer);
+  });
 }
 
 type InitialHead = NonNullable<RepoToolState["initialHead"]>;
@@ -696,8 +742,50 @@ function describeHead(h: InitialHead): string {
   return `detached HEAD \`${h.sha}\``;
 }
 
+const FORMER_BASE_TIPS_QUERY = `
+  query ($owner: String!, $repo: String!, $number: Int!) {
+    repository(owner: $owner, name: $repo) {
+      pullRequest(number: $number) {
+        timelineItems(itemTypes: [BASE_REF_FORCE_PUSHED_EVENT], last: 100) {
+          nodes { ... on BaseRefForcePushedEvent { beforeCommit { oid } } }
+        }
+      }
+    }
+  }
+`;
+
+type FormerBaseTipsResponse = {
+  repository: {
+    pullRequest: {
+      timelineItems: { nodes: { beforeCommit: { oid: string } | null }[] };
+    };
+  };
+};
+
+/** tips the PR's base branch was force-pushed away from. best-effort: none when the lookup fails. */
+async function getFormerBaseTips(ctx: ToolContext, pullNumber: number): Promise<string[]> {
+  try {
+    const response = await ctx.octokit.graphql<FormerBaseTipsResponse>(FORMER_BASE_TIPS_QUERY, {
+      owner: ctx.repo.owner,
+      repo: ctx.repo.name,
+      number: pullNumber,
+    });
+    return response.repository.pullRequest.timelineItems.nodes.flatMap((node) =>
+      node.beforeCommit ? [node.beforeCommit.oid] : []
+    );
+  } catch (error) {
+    log.warning(
+      `» former base tips unavailable: ${error instanceof Error ? error.message : String(error)}`
+    );
+    return [];
+  }
+}
+
 export function CheckoutPrTool(ctx: ToolContext) {
-  const runCheckout = async (pull_number: number): Promise<CheckoutPrResult> => {
+  const runCheckout = async (
+    pull_number: number,
+    signal: AbortSignal
+  ): Promise<CheckoutPrResult> => {
     const prResponse = await ctx.octokit.rest.pulls.get({
       owner: ctx.repo.owner,
       repo: ctx.repo.name,
@@ -729,7 +817,10 @@ export function CheckoutPrTool(ctx: ToolContext) {
       toolState: ctx.toolState,
       shell: ctx.payload.shell,
       postCheckoutScript: ctx.postCheckoutScript,
+      botLogin: ctx.botLogin,
+      botUserId: ctx.botUserId,
       beforeSha: primary.beforeSha,
+      signal,
     });
 
     const tempDir = process.env.PULLFROG_TEMP_DIR;
@@ -745,6 +836,8 @@ export function CheckoutPrTool(ctx: ToolContext) {
 
     // compute incremental diff if we have a beforeSha to compare against
     let incrementalDiffPath: string | undefined;
+    let incrementalDiff: string | undefined;
+    let incrementalEmpty = false;
     let incrementalUnavailable = false;
     let incrementalUnavailableReason: string | undefined;
     if (primary.beforeSha) {
@@ -753,6 +846,7 @@ export function CheckoutPrTool(ctx: ToolContext) {
         baseBranch: pr.baseRef,
         beforeSha: primary.beforeSha,
         headSha: checkoutSha,
+        formerBaseTips: await getFormerBaseTips(ctx, pull_number),
       });
       if (incremental.status === "ok") {
         incrementalDiffPath = join(
@@ -760,9 +854,12 @@ export function CheckoutPrTool(ctx: ToolContext) {
           `pr-${pull_number}-${beforeShort}-${headShort}-incremental.diff`
         );
         writeFileSync(incrementalDiffPath, incremental.diff);
+        incrementalDiff = incremental.diff;
         log.info(
           `» incremental diff computed (${incremental.diff.length} bytes) → ${incrementalDiffPath}`
         );
+      } else if (incremental.status === "empty") {
+        incrementalEmpty = true;
       } else if (incremental.status === "unavailable") {
         incrementalUnavailable = true;
         incrementalUnavailableReason = incremental.reason;
@@ -776,14 +873,24 @@ export function CheckoutPrTool(ctx: ToolContext) {
     const diffPath = join(tempDir, `pr-${pull_number}-${headShort}.diff`);
     writeFileSync(diffPath, formatResult.content);
     log.debug(`wrote diff to ${diffPath} (${formatResult.content.length} bytes)`);
-    primary.diffCoverage = createDiffCoverageState({
-      diffPath,
-      totalLines: countLines({ content: formatResult.content }),
-      toc: formatResult.toc,
-      previous: primary.diffCoverage,
-    });
+    // a re-review's checklist is the delta since the last review, not the whole PR again, and
+    // an unchanged delta has nothing to cover. generated files are never on the checklist.
+    const coverageEntries = incrementalDiff
+      ? parseIncrementalDiffEntries({ content: incrementalDiff })
+      : parseDiffTocEntries({ toc: formatResult.toc });
+    primary.diffCoverage = incrementalEmpty
+      ? undefined
+      : createDiffCoverageState({
+          diffPath: incrementalDiffPath ?? diffPath,
+          totalLines: countLines({ content: incrementalDiff ?? formatResult.content }),
+          tocEntries: coverageEntries.filter((entry) => !GENERATED.test(entry.filename)),
+          previous: primary.diffCoverage,
+        });
+    const coverage = primary.diffCoverage;
     log.debug(
-      `» diff coverage initialized: diffPath=${diffPath}, totalLines=${primary.diffCoverage.totalLines}, tocEntries=${primary.diffCoverage.tocEntries.length}`
+      coverage
+        ? `» diff coverage initialized: diffPath=${coverage.diffPath}, totalLines=${coverage.totalLines}, tocEntries=${coverage.tocEntries.length}`
+        : "» diff coverage skipped: no changes since the last reviewed version"
     );
 
     let impactPath: string | undefined;
@@ -817,6 +924,7 @@ export function CheckoutPrTool(ctx: ToolContext) {
             pullNumber: pull_number,
             baseSha: prResponse.data.base.sha,
             headSha: checkoutSha,
+            signal,
           });
           impactPath = impact.path;
           log.info(
@@ -843,20 +951,22 @@ export function CheckoutPrTool(ctx: ToolContext) {
 
     const incrementalInstructions = incrementalDiffPath
       ? `IMPORTANT: incrementalDiffPath contains ONLY the changes since the last reviewed version ` +
-        `(computed via range-diff). you MUST read incrementalDiffPath FIRST to understand what changed, ` +
-        `then use diffPath for full PR context. do NOT skip the incremental diff. `
-      : incrementalUnavailable
-        ? // say it FAILED rather than leaving the agent to infer "nothing changed"
-          // from an absent field. only suggest diff-tree when the previous
-          // revision is actually PRESENT locally — if the fetch never landed it,
-          // diff-tree needs that object too and would fail identically. see #1139.
-          `NOTE: an incremental diff was expected for this run but could not be computed` +
-          (incrementalUnavailableReason ? ` (${incrementalUnavailableReason})` : "") +
-          `. review the full diffPath instead. ` +
-          (hasLocalCommit(primary.beforeSha)
-            ? `if you need just the delta, \`git diff-tree -p ${primary.beforeSha} ${checkoutSha}\` works without a merge base. `
-            : `the previous revision was never fetched into this shallow checkout, so the full diff is the only option. `)
-        : "";
+        `(computed via range-diff), and it — not diffPath's TOC — is this review's coverage checklist. ` +
+        `read it FIRST and in full, then read only the diffPath ranges the delta needs for context. `
+      : incrementalEmpty
+        ? `NOTE: the PR's net changes are identical to the last reviewed version (e.g. a rebase with no content change), so there is no new diff to cover. `
+        : incrementalUnavailable
+          ? // say it FAILED rather than leaving the agent to infer "nothing changed"
+            // from an absent field. only suggest diff-tree when the previous
+            // revision is actually PRESENT locally — if the fetch never landed it,
+            // diff-tree needs that object too and would fail identically. see #1139.
+            `NOTE: an incremental diff was expected for this run but could not be computed` +
+            (incrementalUnavailableReason ? ` (${incrementalUnavailableReason})` : "") +
+            `. review the full diffPath instead. ` +
+            (hasLocalCommit(primary.beforeSha)
+              ? `if you need just the delta, \`git diff-tree -p ${primary.beforeSha} ${checkoutSha}\` works without a merge base. `
+              : `the previous revision was never fetched into this shallow checkout, so the full diff is the only option. `)
+          : "";
 
     const impactInstructions = impactPath
       ? ` impactPath contains bounded, deterministic reference leads for semantic atoms changed by the PR. ` +
@@ -929,7 +1039,7 @@ export function CheckoutPrTool(ctx: ToolContext) {
       instructions:
         incrementalInstructions +
         `the diff file at diffPath contains a table of contents (TOC) at the top listing every changed file with its line range. ` +
-        `use the TOC line ranges as your checklist and read specific files from the diff instead of reading the entire file. ` +
+        `absent incrementalDiffPath, use the TOC line ranges as your checklist (entries marked \`generated\` are off it) and read specific files from the diff instead of reading the entire file. ` +
         `for example, if the TOC says "src/foo.ts → lines 5-42", read lines 5-42 from diffPath to see that file's changes. ` +
         `review files selectively based on relevance rather than reading everything sequentially. ` +
         `to inspect the PR's changed files, use diffPath — do NOT run \`git diff\` to re-derive what's already in diffPath. the formatted diff with line numbers is authoritative. ` +
@@ -1012,7 +1122,10 @@ export function CheckoutPrTool(ctx: ToolContext) {
         }
       }
 
-      const promise = withCheckoutDeadline(runCheckout(pull_number), pull_number);
+      const promise = withCheckoutDeadline(
+        (signal) => runCheckout(pull_number, signal),
+        pull_number
+      );
       inFlightCheckouts.set(pull_number, promise);
       try {
         return await promise;

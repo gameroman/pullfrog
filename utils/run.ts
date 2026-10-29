@@ -4,6 +4,7 @@ import { reportProgress } from "../mcp/comment.ts";
 import type { ToolContext } from "../mcp/server.ts";
 import { log } from "./cli.ts";
 import { reportErrorToComment } from "./errorReport.ts";
+import { renderFailure } from "./failureBody.ts";
 
 export interface HandleAgentResultParams {
   result: AgentResult;
@@ -41,13 +42,11 @@ export async function handleAgentResult(ctx: HandleAgentResultParams): Promise<M
   const toolState = ctx.toolContext.toolState;
   const mode = toolState.selectedMode;
   const isReviewMode = mode === "Review" || mode === "IncrementalReview";
-  // under `progressComments: disabled` nothing was seeded, so `hadProgressComment`
-  // is false even though the run has a comment target — salvage still applies, and
-  // reportProgress will create the comment for the answer it delivers.
+  // nothing is seeded under `progressComments: disabled`, and seeding can also fail
+  // outright, so `hadProgressComment` is false on runs that still have a comment target —
+  // salvage still applies, and reportProgress will create the comment for the answer.
   const payload = ctx.toolContext.payload;
-  const hasCommentTarget =
-    toolState.hadProgressComment ||
-    (!payload.progressComments && payload.event.issue_number !== undefined);
+  const hasCommentTarget = toolState.hadProgressComment || payload.event.issue_number !== undefined;
   if (!isReviewMode && !toolState.wasUpdated && hasCommentTarget && !ctx.silent) {
     // the agent exited successfully but never landed a GitHub write — either it
     // answered the mention in raw assistant text (which is never posted, only
@@ -85,14 +84,27 @@ export async function handleAgentResult(ctx: HandleAgentResultParams): Promise<M
         // the write itself is failing (auth/permissions) — surface THAT, not
         // the generic "no progress" message, so the real cause isn't masked.
         const error = `failed to deliver agent result: ${getErrorMessage(writeError)}`;
-        await reportErrorToComment({ toolState, error, title: "Error" }).catch(() => {});
+        await reportErrorToComment({
+          toolState,
+          error: renderFailure({
+            headline: "Pullfrog couldn't post its answer to GitHub.",
+            detail: "GitHub refused the write; its error is below. Re-trigger to try again.",
+            error: getErrorMessage(writeError),
+          }),
+        }).catch(() => {});
         return { success: false, error, output: ctx.result.output || "" };
       }
     }
 
     const error = ctx.result.error || "agent completed without reporting progress";
     try {
-      await reportErrorToComment({ toolState, error, title: "Error" });
+      await reportErrorToComment({
+        toolState,
+        error: renderFailure({
+          headline: "The agent finished without posting anything.",
+          detail: "Re-trigger to try again.",
+        }),
+      });
     } catch {}
     return { success: false, error, output: ctx.result.output || "" };
   }

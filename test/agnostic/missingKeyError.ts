@@ -25,8 +25,8 @@ const fixture = defineFixture(
 function validator(result: AgentResult): ValidationCheck[] {
   const output = getAgentOutput(result);
   return [
-    { name: "error_has_marker", passed: output.includes("no API key found") },
-    { name: "error_names_model", passed: output.includes("moonshotai/kimi-k2") },
+    { name: "error_has_marker", passed: output.includes("No API key found") },
+    { name: "error_names_model", passed: output.includes("Kimi K2") },
     { name: "error_names_env_var", passed: output.includes("MOONSHOT_API_KEY") },
   ];
 }
@@ -61,12 +61,4 @@ export const test: TestRunnerOptions = {
     PULLFROG_MODEL: "moonshotai/kimi-k2",
   },
   tags: ["agnostic"],
-  coverage: [
-    "action/utils/apiKeys.ts",
-    "action/utils/agent.ts",
-    "action/utils/openCodeModels.ts",
-    "action/utils/runErrorRenderer.ts",
-    "action/main.ts",
-    "action/models.ts",
-  ],
 };

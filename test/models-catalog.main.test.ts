@@ -1,5 +1,21 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_PROXY_MODEL, modelAliases, resolveDisplayAlias } from "../models.ts";
+import {
+  bundledProviders,
+  DEFAULT_PROXY_MODEL,
+  installProviders,
+  modelAliases,
+  resolveDisplayAlias,
+} from "../models.ts";
+import {
+  applyPublishedCatalogs,
+  fetchPublishedCatalogs,
+  ZEN_UNDEPLOYED,
+} from "../utils/publishedCatalogs.ts";
+
+// assert over the registry runs actually resolve with: the bundled one, rewritten from the
+// published catalogs the way the server serves it (`utils/liveProviders.ts`)
+const catalogs = await fetchPublishedCatalogs(AbortSignal.timeout(60_000));
+installProviders(applyPublishedCatalogs({ catalogs, providers: bundledProviders }));
 
 // ── catalog drift tests ─────────────────────────────────────────────────────
 //
@@ -104,37 +120,6 @@ describe("openRouterResolve models.dev validity", async () => {
   }
 });
 
-// the registry mirrors models.dev's published effort ladders rather than
-// fetching them per run. drift is not cosmetic: claude-code hard-errors on an
-// out-of-range `--effort` before it makes any API call, so a stale ladder
-// breaks runs outright. see wiki/effort.md.
-describe("effort ladders mirror models.dev", async () => {
-  const data = await api;
-
-  const publishedEffort = (spec: string) => {
-    const parsed = parseResolve(spec);
-    const options = data[parsed.provider]?.models[parsed.modelId]?.reasoning_options;
-    return options?.find((o) => o.type === "effort")?.values;
-  };
-
-  for (const alias of modelAliases) {
-    if (alias.routing || alias.fallback) continue;
-
-    it(`${alias.slug} effort matches models.dev`, () => {
-      expect(publishedEffort(alias.resolve)).toEqual(alias.effort);
-    });
-
-    // hoisted so the narrowing survives into the callback
-    const routerResolve = alias.openRouterResolve;
-    if (routerResolve) {
-      it(`${alias.slug} openRouterEffort matches models.dev`, () => {
-        // an absent openRouterEffort means "same ladder as direct"
-        expect(publishedEffort(routerResolve)).toEqual(alias.openRouterEffort ?? alias.effort);
-      });
-    }
-  }
-});
-
 describe("DEFAULT_PROXY_MODEL models.dev validity", async () => {
   const data = await api;
   const parsed = parseResolve(DEFAULT_PROXY_MODEL);
@@ -158,16 +143,8 @@ describe("DEFAULT_PROXY_MODEL models.dev validity", async () => {
   });
 });
 
-type OpenRouterModel = { id: string };
-type OpenRouterModelsResponse = { data: OpenRouterModel[] };
-
-const openRouterApi = fetch("https://openrouter.ai/api/v1/models").then(
-  (r) => r.json() as Promise<OpenRouterModelsResponse>
-);
-
-describe("openRouterResolve OpenRouter API validity", async () => {
-  const orData = await openRouterApi;
-  const orModelIds = new Set(orData.data.map((m) => m.id));
+describe("openRouterResolve OpenRouter API validity", () => {
+  const orModelIds = catalogs.served.openrouter;
   const seen = new Set<string>();
 
   for (const alias of modelAliases) {
@@ -205,16 +182,12 @@ describe("openRouterResolve OpenRouter API validity", async () => {
 // aliases legitimately point at dead resolve targets — the terminal is what
 // actually runs at the agent CLI.
 
-type ZenModel = { id: string };
-type ZenModelsResponse = { data: ZenModel[] };
-
-const zenApi = fetch("https://opencode.ai/zen/v1/models").then(
-  (r) => r.json() as Promise<ZenModelsResponse>
-);
-
-describe("opencode Zen served list", async () => {
-  const zenData = await zenApi;
-  const zenIds = new Set(zenData.data.map((m) => m.id));
+describe("opencode Zen served list", () => {
+  // listing is not serving — subtract the models measured as undeployed, so a
+  // dead model fails here instead of passing on catalog membership alone.
+  const zenIds = new Set(
+    [...catalogs.served.opencode].filter((id) => !ZEN_UNDEPLOYED.includes(id))
+  );
   const seen = new Set<string>();
 
   for (const alias of modelAliases) {
@@ -243,7 +216,12 @@ describe("opencode Zen served list", async () => {
 // no sibling alias may name a Zen-served model newer than the mirror's own.
 describe("opencode mirrors don't trail their siblings", async () => {
   const data = await api;
-  const zenIds = new Set((await zenApi).data.map((m) => m.id));
+  // same subtraction as the served-list check: a sibling sitting on a model Zen
+  // will not serve is not "ahead", and treating it as ahead pins this mirror to
+  // the dead build and rejects the step down to a served one.
+  const zenIds = new Set(
+    [...catalogs.served.opencode].filter((id) => !ZEN_UNDEPLOYED.includes(id))
+  );
   const modelId = (spec: string) => spec.slice(spec.lastIndexOf("/") + 1);
   const aliasKey = (slug: string) => slug.slice(slug.indexOf("/") + 1);
   const released = (spec: string) => {

@@ -141,9 +141,14 @@ export async function startGitAuthServer(tmpdir: string): Promise<GitAuthServer>
     // why neither the script nor the code is single-use. cleanup happens
     // in $git()'s finally.
     // 409 = code was already revoked by $git()'s finally (replay attempt).
+    // the prompt names the URL git is authenticating to (`for '<url>'` from git,
+    // `for "<url>"` from git-lfs); the token is only ever for the GitHub host.
+    const host = new URL(process.env.GITHUB_SERVER_URL || "https://github.com").hostname;
     const content = [
       `#!/usr/bin/env node`,
       `var a=process.argv[2]||"";`,
+      `var m=/ for ['"]([^'"]+)['"]/.exec(a),u="";try{u=new URL(m[1]).hostname}catch(e){}`,
+      `if(u!==${JSON.stringify(host)}){process.stderr.write("askpass: no credential for "+(u||"this prompt")+"\\n");process.exit(1)}`,
       `if(/^Username/i.test(a)){process.stdout.write("x-access-token\\n")}`,
       `else{var h=require("http");`,
       `h.get("http://127.0.0.1:${port}/${code}",function(r){`,

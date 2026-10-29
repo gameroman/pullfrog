@@ -33,7 +33,8 @@ export function IssueInfoTool(ctx: ToolContext) {
       });
 
       // set issue context
-      primaryRepoState(ctx.toolState).issueNumber = issue_number;
+      // the first issue read is the run's subject; later reads inspect candidates or references
+      primaryRepoState(ctx.toolState).issueNumber ??= issue_number;
 
       const hints: string[] = [];
       if (data.comments > 0) {

@@ -1,3 +1,6 @@
+import { renderFailure } from "./failureBody.ts";
+import { PROVIDER_BILLING_EXHAUSTED_LABEL } from "./providerErrors.ts";
+
 const MAX_STDERR_BYTES = 3000;
 
 /**
@@ -36,78 +39,65 @@ export type AgentDiagnostic = {
 };
 
 /**
- * Build a user-facing markdown body for an agent hang or failure.
+ * The body for a run the activity watchdog ended. Rendered into both the PR
+ * progress comment and the job summary; `null` when the harness left no
+ * diagnostic, so the caller falls back to its bare-error rendering.
  *
- * Rendered into both the PR progress comment and the GitHub Actions job
- * summary. Returns `null` when no diagnostic is available, which signals to
- * the caller to fall back to its bare-error rendering.
- *
- * `errorMessage` is the underlying timer / spawn reject string (e.g.
- * `activity timeout: no output for 301s`). The idle seconds are parsed out
- * of it for the hang explanation — total runtime would overstate the stall
- * for runs that streamed for a long time before going quiet.
+ * The headline says whose side went quiet, because a silent run is nearly
+ * always the provider's and "Pullfrog stalled" read as ours. The agent's last
+ * output goes in a collapsed section for whoever wants it.
  */
 export function formatAgentHangBody(input: {
   diagnostic: AgentDiagnostic | undefined;
-  isHang: boolean;
   errorMessage: string;
 }): string | null {
-  if (!input.diagnostic) return null;
+  const diagnostic = input.diagnostic;
+  if (!diagnostic) return null;
+  const output = renderStderrTail(diagnostic.recentStderr);
+  const details = output ? { summary: "Last agent output", text: output } : undefined;
+  const idle = formatIdle(diagnostic.idleSec ?? parseIdleSec(input.errorMessage));
 
   // billing exhaustion (CreditsError / FreeUsageLimitError / spending cap /
   // Insufficient balance) is mis-classified as transient by upstream harnesses
   // and the run only ends when the activity-timeout watchdog fires (see #778).
-  // when we recognise the billing label, replace the generic "stalled — auth
-  // error" headline with a billing-specific CTA that names the actual remedy.
-  if (input.diagnostic.lastProviderError === "provider billing exhausted") {
-    return formatBillingExhaustedBody(input.diagnostic);
+  if (diagnostic.lastProviderError === PROVIDER_BILLING_EXHAUSTED_LABEL) {
+    const billingUrl = extractBillingUrl(diagnostic.recentStderr);
+    return renderFailure({
+      headline: "Your model provider's account is out of credit.",
+      detail:
+        "The provider kept refusing the request, so Pullfrog stopped the run. Top up the account, then re-trigger.",
+      details,
+      links: billingUrl ? [{ label: "Top up", url: billingUrl }] : [],
+    });
   }
-
-  const verb = input.isHang ? "stalled" : "failed";
-  const cause = input.diagnostic.lastProviderError
-    ? ` — likely cause: \`${input.diagnostic.lastProviderError}\``
-    : "";
-  const headline = `**${input.diagnostic.label} ${verb}**${cause}`;
-
-  const explanation = formatExplanation({
-    isHang: input.isHang,
-    errorMessage: input.errorMessage,
-    idleSec: input.diagnostic.idleSec,
+  if (diagnostic.lastProviderError) {
+    return renderFailure({
+      headline: "The model provider kept returning errors, so Pullfrog stopped this run.",
+      detail: `The last one was \`${diagnostic.lastProviderError}\`. Re-trigger to try again.`,
+      details,
+    });
+  }
+  // the stall in #1120: the turn is under way but the model never produced a
+  // part. keyed off `sawModelOutput`, not `eventCount` — see AgentDiagnostic.
+  if (!diagnostic.sawModelOutput) {
+    return renderFailure({
+      headline: `The model never responded, so Pullfrog stopped this run${idle ? ` after ${idle}` : ""}.`,
+      detail:
+        "The request went out but nothing came back. This is usually temporary, so re-trigger to try again.",
+      details,
+    });
+  }
+  return renderFailure({
+    headline: `The agent went quiet${idle ? ` for ${idle}` : ""}, so Pullfrog stopped this run.`,
+    detail: "Re-trigger to try again.",
+    details,
   });
-  const parts = [headline, "", `${explanation} ${formatEventsPart(input.diagnostic)}`];
-
-  const tail = renderStderrTail(input.diagnostic.recentStderr);
-  if (tail) {
-    // pick a fence longer than any backtick run in the body so a stderr line
-    // containing ``` (provider error JSON occasionally embeds it) can't
-    // terminate the fence early and corrupt the rest of the markdown.
-    const fence = pickFence(tail);
-    parts.push(
-      "",
-      "<details><summary>Recent agent stderr</summary>",
-      "",
-      fence,
-      tail,
-      fence,
-      "",
-      "</details>"
-    );
-  }
-
-  return parts.join("\n");
 }
 
-function formatExplanation(input: {
-  isHang: boolean;
-  errorMessage: string;
-  idleSec: number | undefined;
-}): string {
-  if (!input.isHang) return `The agent exited unexpectedly: ${input.errorMessage}`;
-  const idleSec = input.idleSec ?? parseIdleSec(input.errorMessage);
-  if (idleSec === undefined) {
-    return "The agent stopped emitting events and was killed by the activity-timeout watchdog.";
-  }
-  return `The agent stopped emitting events for ${idleSec}s and was killed by the activity-timeout watchdog.`;
+function formatIdle(seconds: number | undefined): string | undefined {
+  if (seconds === undefined) return undefined;
+  if (seconds < 90) return `${seconds} seconds`;
+  return `${Math.round(seconds / 60)} minutes`;
 }
 
 /** fallback for the v1 spawn path, whose reject string embeds the span. */
@@ -116,34 +106,11 @@ function parseIdleSec(message: string): number | undefined {
   return match ? Number(match[1]) : undefined;
 }
 
-function formatEventsPart(diagnostic: AgentDiagnostic): string {
-  // when the provider-error label already names the cause in the headline,
-  // the nudges below contradict it (e.g. an immediate 401 also produces no
-  // model output but isn't a reachability problem). suppress them.
-  if (diagnostic.lastProviderError) {
-    return `${diagnostic.eventCount} events were processed before the failure.`;
-  }
-  // the stall in #1120: the turn is under way but the model never produced a
-  // part. keyed off `sawModelOutput`, not `eventCount` — see AgentDiagnostic.
-  if (!diagnostic.sawModelOutput) {
-    return "The model produced no output at all before the stall — the request was sent but nothing came back. This is usually transient; re-running often succeeds.";
-  }
-  return `${diagnostic.eventCount} events were processed before the failure.`;
-}
-
 function renderStderrTail(lines: readonly string[]): string {
   if (lines.length === 0) return "";
   const joined = lines.join("\n");
   if (joined.length <= MAX_STDERR_BYTES) return joined;
   return `... (older lines truncated)\n${joined.slice(-MAX_STDERR_BYTES)}`;
-}
-
-function pickFence(content: string): string {
-  let max = 0;
-  for (const match of content.matchAll(/`+/g)) {
-    if (match[0].length > max) max = match[0].length;
-  }
-  return "`".repeat(Math.max(3, max + 1));
 }
 
 /**
@@ -160,34 +127,4 @@ function extractBillingUrl(lines: readonly string[]): string | undefined {
     if (m) return m[0];
   }
   return undefined;
-}
-
-function formatBillingExhaustedBody(diagnostic: AgentDiagnostic): string {
-  const headline = `**${diagnostic.label} stopped** — your model provider returned a billing-exhausted response.`;
-
-  const billingUrl = extractBillingUrl(diagnostic.recentStderr);
-  const cta = billingUrl
-    ? `Top up your provider balance, then re-run: [${billingUrl}](${billingUrl})`
-    : "Top up your model-provider balance (or rotate to a key with remaining credits) and re-run.";
-  const explanation =
-    "The agent kept retrying the request because the provider marked the failure as transient. Pullfrog's activity-timeout watchdog ended the run after no further events were emitted.";
-
-  const parts = [headline, "", explanation, "", cta];
-
-  const tail = renderStderrTail(diagnostic.recentStderr);
-  if (tail) {
-    const fence = pickFence(tail);
-    parts.push(
-      "",
-      "<details><summary>Recent agent stderr</summary>",
-      "",
-      fence,
-      tail,
-      fence,
-      "",
-      "</details>"
-    );
-  }
-
-  return parts.join("\n");
 }

@@ -33,8 +33,21 @@ const DebugInput = type.enumerated("disabled", "enabled");
 export const JsonPayload = type({
   "~pullfrog": "true",
   version: "string",
+  // the server's run type, forwarded verbatim to run-context. optional so a
+  // payload from an older server build still parses against a newer action.
+  "type?": "string | undefined",
   "model?": "string | undefined",
   "modelExplicit?": "boolean | undefined",
+  // optional so a payload from a pre-router server build still parses against a
+  // newer action across a rolling deploy. a new `source` value is released in the
+  // action before the server emits it: the published action rejects the payload.
+  "routing?": type({
+    tier: "'minimal' | 'light' | 'standard' | 'deep'",
+    stakes: "number",
+    workload: "number",
+    source: "'jev' | 'scorer' | 'heuristic' | 'fixed'",
+    rationale: "string",
+  }).or("undefined"),
   "effort?": "number | string | undefined",
   "debug?": "boolean | undefined",
   prompt: "string",
@@ -52,6 +65,9 @@ export const JsonPayload = type({
     // still parses against a newer action across a rolling deploy.
     "unavailable?": "string[]",
   }).or("undefined"),
+  // opaque handle to the server-persisted cross-repo grant. optional so a
+  // payload from an older server build still parses against a newer action.
+  "xrepoGrant?": "string | undefined",
   "timeout?": "string | undefined",
   "progressComment?": type({
     id: "string",
@@ -61,6 +77,9 @@ export const JsonPayload = type({
   // against a newer action across a rolling deploy.
   "checkRun?": type({ id: "string" }).or("undefined"),
   "generateSummary?": "boolean | undefined",
+  // optional so a payload from a pre-canary server build still parses against a
+  // newer action across a rolling deploy.
+  "codexArm?": "boolean | undefined",
 });
 
 // permission levels that indicate collaborator status (have push access)
@@ -70,6 +89,14 @@ const COLLABORATOR_PERMISSIONS: AuthorPermission[] = ["admin", "maintain", "writ
 function isCollaborator(event: PayloadEvent): boolean {
   const perm = event.authorPermission;
   return perm !== undefined && COLLABORATOR_PERMISSIONS.includes(perm);
+}
+
+/**
+ * a run steered by someone resolved as unable to push here. an absent permission
+ * is a run no outside author steers (CI fix, a review bot on Pullfrog's own PR).
+ */
+export function isOutsideAuthor(event: PayloadEvent): boolean {
+  return event.authorPermission !== undefined && !isCollaborator(event);
 }
 
 // inputs schema - action inputs from core.getInput()
@@ -107,6 +134,95 @@ function resolveCwd(cwd: string | undefined): string | undefined {
 
 export type ResolvedPromptInput = string | typeof JsonPayload.infer;
 
+/**
+ * the envelope's marker key, searched for in the RAW input rather than a parse result —
+ * the whole point is a payload that no longer parses. a plain substring rather than a
+ * regex, so it doubles as the cheap pre-filter and as an honest scan bound.
+ */
+const DISPATCH_PAYLOAD_KEY = '"~pullfrog"';
+
+/**
+ * the complete JSON object starting at `open`, or undefined when its braces never balance.
+ * string-aware: a brace inside a JSON string value is punctuation, not structure, and the
+ * envelope's `prompt` and `baseInstructions` routinely contain both braces and quotes.
+ */
+function sliceBalancedObject(text: string, open: number): string | undefined {
+  let depth = 0;
+  let inString = false;
+  for (let i = open; i < text.length; i++) {
+    const char = text[i];
+    if (inString) {
+      if (char === "\\") i++;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') inString = true;
+    else if (char === "{") depth++;
+    else if (char === "}" && --depth === 0) return text.slice(open, i + 1);
+  }
+  return undefined;
+}
+
+/**
+ * a COMPLETE, schema-valid dispatch envelope embedded anywhere in `text`, or undefined.
+ *
+ * exact rather than heuristic, and that distinction is the whole point: `prompt` is a public
+ * arbitrary-string input, so any predicate looser than "this parses as a real envelope"
+ * refuses prompts that merely QUOTE one — and the people most likely to write such a prompt
+ * are whoever is working on this file. `{"~pullfrog": true, "version": "1.2.3"}` fails
+ * `JsonPayload` (no `prompt`) and passes through; a genuinely mangled dispatch does not.
+ *
+ * EVERY `{` before the LAST marker is tried, because a preamble may quote an abbreviated
+ * marker of its own before interpolating the real envelope — anchoring on the first
+ * occurrence would leave that envelope invisible and preserve the exact silent downgrade
+ * this guard exists to stop. an object opens before its own key, so the last marker is a
+ * sound upper bound, and the whole scan sits behind a substring miss that costs one pass.
+ *
+ * `version` is deliberately NOT compatibility-checked: a version we would refuse to RUN is
+ * still unambiguously our envelope, and saying so beats a confusing silent downgrade.
+ */
+function findEmbeddedDispatchPayload(text: string): unknown {
+  const limit = text.lastIndexOf(DISPATCH_PAYLOAD_KEY);
+  if (limit === -1) return undefined;
+  for (
+    let open = text.indexOf("{");
+    open !== -1 && open < limit;
+    open = text.indexOf("{", open + 1)
+  ) {
+    const candidate = sliceBalancedObject(text, open);
+    if (!candidate) continue;
+    try {
+      const parsed: unknown = JSON.parse(candidate);
+      if (JsonPayload.allows(parsed)) return parsed;
+    } catch {
+      // this `{` did not open an envelope; try the next
+    }
+  }
+  return undefined;
+}
+
+/**
+ * a workflow whose `prompt:` interpolates `${{ inputs.prompt }}` into a larger block hands
+ * us a dispatch payload we cannot parse, and every field on it is then lost in SILENCE:
+ * the seeded progress comment (so the "Leaping into action..." comment strands on the PR
+ * until the completion webhook sweeps it and alerts), the event (so the run has no PR
+ * number, and `expectsReviewOutput` retires the unsubmitted-review gate — a Review run
+ * that submits nothing then exits `success`), the check run, standing instructions, and
+ * the cross-repo grant. the run bills a full agent turn and delivers a fraction of the
+ * ask, with nothing anywhere saying why. refuse instead: `core.setFailed` renders this as
+ * an annotation on the run, and the fix is one line of YAML.
+ */
+function assertDispatchPayloadIntact(promptInput: string): void {
+  if (!findEmbeddedDispatchPayload(promptInput)) return;
+  throw new Error(
+    "this workflow wraps `${{ inputs.prompt }}` in other text, so Pullfrog's dispatch payload " +
+      "can't be read and the run would lose its pull request context, its progress comment, and " +
+      "its standing instructions. in `.github/workflows/pullfrog.yml`, set `prompt:` to exactly " +
+      "`${{ inputs.prompt }}`, and move your own preamble into Standing instructions in the " +
+      "Pullfrog console."
+  );
+}
+
 export function resolvePromptInput(): ResolvedPromptInput {
   const promptInput = core.getInput("prompt");
   const promptFile = core.getInput("prompt_file");
@@ -130,10 +246,12 @@ export function resolvePromptInput(): ResolvedPromptInput {
     parsed = JSON.parse(promptInput);
   } catch {
     // JSON parse error is fine (plain text prompt)
-    return promptInput;
   }
 
   if (!parsed || typeof parsed !== "object" || !("~pullfrog" in parsed)) {
+    // both ways of getting here — unparseable, or parsed but not ours — are also how a
+    // MANGLED dispatch payload arrives, which is fatal rather than plain text.
+    assertDispatchPayloadIntact(promptInput);
     // if it doesn't look like a pullfrog payload, return the plain text prompt
     return promptInput;
   }
@@ -246,6 +364,13 @@ export function resolvePayload(
     resolvedShell = "restricted";
   }
 
+  // a run steered by someone who cannot push here does not push for them. an
+  // absent permission is a run no outside author steers (CI fix, a review bot on
+  // Pullfrog's own PR), so only a resolved non-collaborator role clamps.
+  const push = isOutsideAuthor(event)
+    ? "disabled"
+    : (inputs.push ?? repoSettings.push ?? "restricted");
+
   // build payload - precedence: inputs > repoSettings > fallbacks
   // note: modes are NOT in payload - they come from repoSettings in main()
   return {
@@ -255,6 +380,7 @@ export function resolvePayload(
     // explicit only when the model came from a per-run override flag (carried on
     // the JSON payload). a GHA `model` input or the repo default is not explicit.
     modelExplicit: jsonPayload?.modelExplicit ?? false,
+    routing: jsonPayload?.routing,
     effort,
     debug: debug || undefined,
     prompt,
@@ -267,14 +393,16 @@ export function resolvePayload(
     previousRunsNote: jsonPayload?.previousRunsNote,
     event,
     xrepo: jsonPayload?.xrepo,
+    xrepoGrant: jsonPayload?.xrepoGrant,
     timeout: inputs.timeout ?? jsonPayload?.timeout,
     cwd: resolveCwd(inputs.cwd),
     progressComment: jsonPayload?.progressComment,
     checkRun: jsonPayload?.checkRun,
     generateSummary: jsonPayload?.generateSummary,
+    codexArm: jsonPayload?.codexArm,
 
     // permissions: inputs > repoSettings > fallbacks
-    push: inputs.push ?? repoSettings.push ?? "restricted",
+    push,
     shell: resolvedShell,
 
     // the `pullfrog` run-lifecycle check. ON by default — the whole point is that a PR

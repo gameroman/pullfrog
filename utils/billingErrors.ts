@@ -9,9 +9,10 @@
  * Actions job summary and the PR progress comment.
  *
  * Lives outside `main.ts` so adding a new error `code` branch is a one-file
- * edit that does not retrigger the full LLM CI matrix (`action/main.ts` is
- * in `action/test/coverage.ts::ALWAYS_RUN_ALL`).
+ * edit rather than an orchestrator edit (see wiki/main.md).
  */
+
+import { renderFailure } from "./failureBody.ts";
 
 /**
  * Billing-layer error surfaced from `/api/proxy-token` as a 402. User-actionable,
@@ -54,9 +55,16 @@ export class BillingError extends Error {
  * GH Actions apply whatever retry policy the workflow has configured.
  */
 export class TransientError extends Error {
-  constructor(message: string) {
+  /** the customer-facing follow-up to `message`, which is the headline. */
+  detail: string;
+
+  constructor(
+    message: string,
+    detail = "This is on our side, and nothing was billed. The next run should succeed; if it keeps failing, check [status.pullfrog.com](https://status.pullfrog.com)."
+  ) {
     super(message);
     this.name = "TransientError";
+    this.detail = detail;
   }
 }
 
@@ -71,6 +79,16 @@ function billingConsoleUrl(owner: string): string {
 }
 
 /**
+ * Why the org commercial gate refused a run (billing model v2), resolved by
+ * `resolveTeamRunAccess` and carried unchanged through the paywall comment, the
+ * run-context 402 and the proxy-token 402. `commercial`: the no-card trial
+ * wound down to `paused`. `subscription_ended`: a paid subscription was
+ * canceled and lapsed to `paused`. `subscription_unpaid`: the renewal failed
+ * dunning.
+ */
+export type CommercialRefusal = "commercial" | "subscription_ended" | "subscription_unpaid";
+
+/**
  * Canonical paused-run paywall body (billing model v2). Single source of truth so
  * the two surfaces that show it can never drift: the trigger-time comment (a run
  * refused before it starts, `triggerWorkflow.postPaywallComment`) and the mid-run
@@ -78,40 +96,43 @@ function billingConsoleUrl(owner: string): string {
  * caller's billing surface (each passes its own, internal plan page vs console).
  */
 export function commercialPaywallBody(params: {
-  reason: "commercial" | "subscription_unpaid";
+  reason: CommercialRefusal;
   ownerLogin: string;
   url: string;
+  freshReply?: boolean | undefined;
 }): string {
-  if (params.reason === "commercial") {
-    return [
-      `**Pullfrog needs a confirmed Pro plan for ${params.ownerLogin}, so this run paused.**`,
-      "",
-      "Open Plan and payment to confirm Pro or review the organization's billing status.",
-      "",
-      `[Review plan and payment →](${params.url})`,
-    ].join("\n");
+  let action: string;
+  switch (params.reason) {
+    case "commercial":
+      action = "upgrade";
+      break;
+    case "subscription_ended":
+      action = "resubscribe";
+      break;
+    case "subscription_unpaid":
+      action = "update billing";
+      break;
+    default:
+      return params.reason satisfies never;
   }
-  params.reason satisfies "subscription_unpaid";
   return [
-    `**Pullfrog paused runs on ${params.ownerLogin}: the Pro renewal failed.**`,
+    `**Pullfrog is ${params.freshReply ? "still paused" : "paused"} for ${params.ownerLogin}.**`,
     "",
-    "Update the card on file to resume runs.",
-    "",
-    `[Update billing →](${params.url})`,
+    `An org owner can [${action}](${params.url}) to resume private-repo runs.`,
   ].join("\n");
 }
 
 /**
  * commercial-gate copy for action runs, linked to the account billing card.
  *
- * if this fires on a `pullfrog/preview-*` repo it is an infrastructure bug, not
+ * if this fires on a `PullfrogDev/preview-*` repo it is an infrastructure bug, not
  * a billing state — those repos have no real billing state to refuse. the
  * original cause was the gate comparing the subscription's originating host
  * with strict equality, which no preview could satisfy against a cloned
  * production row; see `isSubscriptionHostTrusted` and wiki/billing-model-v2.md.
  */
 export function formatCommercialGateSummary(params: {
-  reason: "commercial" | "subscription_unpaid";
+  reason: CommercialRefusal;
   ownerLogin: string;
 }): string {
   return commercialPaywallBody({
@@ -154,44 +175,41 @@ export function formatCommercialGateSummary(params: {
  *     or amount below threshold). Direct them to top up or enable auto-reload.
  */
 export function formatBillingErrorSummary(error: BillingError, owner: string): string {
+  const billing = { label: "Add credit", url: billingConsoleUrl(owner) };
   if (error.code === "router_requires_card") {
-    return [
-      "**Your Pullfrog Router balance is empty.**",
-      "",
-      "Add a card to top up your Router balance, or bring your own key. Router usage is billed at provider cost with no platform markup.",
-      "",
-      `[Add a card to top up →](${billingConsoleUrl(owner)}) · [Bring your own key →](${billingConsoleUrl(owner)})`,
-    ].join("\n");
+    return renderFailure({
+      headline: "Your Pullfrog Router balance is empty.",
+      detail:
+        "Add a card to top it up, or connect your own provider key. Router usage is billed at provider cost with no markup.",
+      links: [{ label: "Billing and providers", url: billingConsoleUrl(owner) }],
+    });
   }
 
   if (error.code === "router_balance_exhausted") {
-    return [
-      "**Your Pullfrog Router balance is exhausted.**",
-      "",
-      "You have a payment method on file but auto-reload is disabled, so runs paused once your balance went past the overdraft buffer.",
-      "",
-      `[Top up balance →](${billingConsoleUrl(owner)}) · [Enable auto-reload →](${billingConsoleUrl(owner)})`,
-    ].join("\n");
+    return renderFailure({
+      headline: "Your Pullfrog Router balance is used up.",
+      detail:
+        "Auto-reload is off, so runs paused once the balance passed its overdraft buffer. Add credit or turn on auto-reload.",
+      links: [billing],
+    });
   }
 
   if (error.code === "router_keylimit_exhausted") {
-    return [
-      "**This run was cut short: your Pullfrog Router balance ran out mid-run.**",
-      "",
-      "OpenRouter stopped the agent because the per-run budget was exhausted. Your wallet is now negative; top up or enable auto-reload to keep runs flowing.",
-      "",
-      `[Top up balance →](${billingConsoleUrl(owner)}) · [Enable auto-reload →](${billingConsoleUrl(owner)})`,
-    ].join("\n");
+    return renderFailure({
+      headline: "Your Pullfrog Router balance ran out partway through this run.",
+      detail: "Add credit or turn on auto-reload to keep runs going.",
+      links: [billing],
+    });
   }
 
   if (error.code === "router_monthly_limit") {
-    return [
-      "**Pullfrog Router hit its monthly spend limit.**",
-      "",
-      "Auto-reloads are paused for the rest of this UTC month. Ask your admin to raise the cap, or wait for it to reset at 00:00 UTC on the 1st.",
-      "",
-      `[Adjust limit →](${billingConsoleUrl(owner)})`,
-    ].join("\n");
+    return renderFailure({
+      headline:
+        "Your Pullfrog Router balance is empty, and the monthly spend limit blocks the next auto-reload.",
+      detail:
+        "Add credit by hand, ask an org owner to raise the limit, or wait for it to reset at 00:00 UTC on the 1st.",
+      links: [billing],
+    });
   }
 
   // billing model v2 org commercial gate: the org's Team trial wound down to a
@@ -206,6 +224,13 @@ export function formatBillingErrorSummary(error: BillingError, owner: string): s
     });
   }
 
+  if (error.code === "subscription_ended") {
+    return formatCommercialGateSummary({
+      reason: "subscription_ended",
+      ownerLogin: owner,
+    });
+  }
+
   if (error.code === "subscription_unpaid") {
     return formatCommercialGateSummary({
       reason: "subscription_unpaid",
@@ -215,45 +240,35 @@ export function formatBillingErrorSummary(error: BillingError, owner: string): s
 
   if (error.needsReauthentication) {
     const code = error.declineCode ?? "authentication_required";
-    return [
-      `**Your card issuer requires 3D Secure on every charge** (\`${code}\`).`,
-      "",
-      "Pullfrog can't complete a 3DS challenge from inside a workflow. Top up your Router balance once in Stripe Checkout, subsequent runs draw from the prepaid balance without re-triggering 3DS.",
-      "",
-      `[Top up balance →](${billingConsoleUrl(owner)})`,
-    ].join("\n");
+    return renderFailure({
+      headline: `Your card issuer requires 3D Secure on every charge (\`${code}\`).`,
+      detail:
+        "Pullfrog can't complete a 3D Secure check from inside a workflow. Add credit once by hand, and later runs draw on that balance without another check.",
+      links: [billing],
+    });
   }
 
   if (error.declineCode) {
-    return [
-      `**Your card was declined** (\`${error.declineCode}\`).`,
-      "",
-      "Update your payment method and Pullfrog will retry on the next run.",
-      "",
-      `[Update payment method →](${billingConsoleUrl(owner)})`,
-    ].join("\n");
+    return renderFailure({
+      headline: `Your card was declined (\`${error.declineCode}\`).`,
+      detail: "Update your payment method, and Pullfrog will retry on the next run.",
+      links: [{ label: "Update payment method", url: billingConsoleUrl(owner) }],
+    });
   }
 
-  return [
-    "**Your Pullfrog balance is empty.**",
-    "",
-    "Top up your balance or enable auto-reload to keep runs flowing.",
-    "",
-    `[Manage billing →](${billingConsoleUrl(owner)})`,
-  ].join("\n");
+  return renderFailure({
+    headline: "Your Pullfrog balance is empty.",
+    detail: "Add credit or turn on auto-reload to keep runs going.",
+    links: [billing],
+  });
 }
 
 /**
  * Render a TransientError as user-facing markdown. Distinct framing from
  * BillingError so the user doesn't read an alarm and assume their card
- * failed, this branch is "our fault, retry shortly", not theirs.
+ * failed, this branch is "our fault, retry shortly", not theirs. Both parts are
+ * ours and customer-ready; the server's own wording goes to the log.
  */
-export function formatTransientErrorSummary(error: TransientError, owner: string): string {
-  return [
-    "**Pullfrog billing is temporarily unavailable.**",
-    "",
-    error.message,
-    "",
-    `Usually transient; the next dispatch should succeed. If it persists, check [status.pullfrog.com](https://status.pullfrog.com) or [your console](${billingConsoleUrl(owner)}).`,
-  ].join("\n");
+export function formatTransientErrorSummary(error: TransientError): string {
+  return renderFailure({ headline: error.message, detail: error.detail });
 }

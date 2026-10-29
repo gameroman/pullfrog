@@ -6,6 +6,16 @@ export const PROVIDER_BILLING_EXHAUSTED_LABEL = "provider billing exhausted";
 /** Stable label for "OpenRouter can route this model nowhere you permit". */
 export const PROVIDER_NO_ENDPOINTS_LABEL = "provider no routable endpoints";
 
+/**
+ * A SUBSCRIPTION usage window that has run out, which is deliberately NOT
+ * `PROVIDER_BILLING_EXHAUSTED_LABEL`: that label routes to a body whose CTA is
+ * "Top up your provider balance", and a capped ChatGPT or Zen plan has no
+ * balance to top up — it resets on its own. This label carries the cause into
+ * the hang headline and lets the generic body stand; a turn it ends directly
+ * gets its own wait-or-raise copy in `renderRunError` (#1474).
+ */
+export const PROVIDER_USAGE_LIMIT_LABEL = "provider usage limit reached";
+
 // status codes are only treated as provider errors when they are adjacent to
 // a recognised status key. this rejects commit SHAs that happen to contain
 // "429", version strings, file hashes, etc.
@@ -45,7 +55,15 @@ const PROVIDER_ERROR_PATTERNS: ProviderErrorPattern[] = [
   // …/settings/credits`) matched neither this nor `requires more credits`, so
   // the one run in that episode that was a genuinely empty wallet rendered with
   // no CTA at all while runs 1-6 rendered correctly.
-  { regex: /Insufficient (?:balance|credits)/i, label: PROVIDER_BILLING_EXHAUSTED_LABEL },
+  // `account funds` is Zen's (#1474).
+  {
+    regex: /Insufficient (?:balance|credits|account funds)/i,
+    label: PROVIDER_BILLING_EXHAUSTED_LABEL,
+  },
+  // OpenAI's `You have no credits remaining` (#1474).
+  { regex: /no credits remaining/i, label: PROVIDER_BILLING_EXHAUSTED_LABEL },
+  // Codex on a ChatGPT workspace: `Your workspace is out of credits. Add credits to continue.`
+  { regex: /workspace is out of credits/i, label: PROVIDER_BILLING_EXHAUSTED_LABEL },
   { regex: /credit balance is too low/i, label: PROVIDER_BILLING_EXHAUSTED_LABEL },
   // "spending cap" (Gemini) and "spending limit" (xAI, #1076) are the same
   // condition in two house styles — a configured ceiling was reached.
@@ -67,6 +85,17 @@ const PROVIDER_ERROR_PATTERNS: ProviderErrorPattern[] = [
   // the wallet-shaped patterns above reach, and its 400 sits nowhere near a
   // `status:` key either — so the whole message was dropped on the floor (#1208).
   { regex: ANTHROPIC_SPEND_CAP_PATTERN, label: PROVIDER_BILLING_EXHAUSTED_LABEL },
+  // OpenCode Zen / Codex-subscription cap: `AI_APICallError: The usage limit has
+  // been reached`. Its noun is "usage limit" with no "rate", no status code and
+  // no wallet wording, so every pattern here missed it and `lastProviderError`
+  // stayed unset — which suppresses nothing, so the run was reported as "The
+  // model produced no output at all … usually transient; re-running often
+  // succeeds" while the same log held nine of these. Measured on a live account
+  // whose ChatGPT subscription was capped.
+  { regex: /\bthe usage limit has been reached\b/i, label: PROVIDER_USAGE_LIMIT_LABEL },
+  // the Codex CLI's wording for the same capped plan: `You’ve hit your usage limit. … try
+  // again at 7:58 AM.` Claude's `hit your session limit` names its window and stays out.
+  { regex: /\bhit your usage limit\b/i, label: PROVIDER_USAGE_LIMIT_LABEL },
   // the OpenRouter shapes `isRouterKeylimitExhaustedError` matches. on a Router
   // run those mean the PULLFROG wallet is empty and `renderRunError` returns a
   // `BillingError` before ever reaching this list; on a BYOK run the very same
@@ -230,6 +259,11 @@ export function isProviderBillingExhausted(text: string): boolean {
   return findProviderErrorMatch(text)?.label === PROVIDER_BILLING_EXHAUSTED_LABEL;
 }
 
+/** A capped subscription window or a configured usage limit — see `PROVIDER_USAGE_LIMIT_LABEL`. */
+export function isProviderUsageLimit(text: string): boolean {
+  return findProviderErrorMatch(text)?.label === PROVIDER_USAGE_LIMIT_LABEL;
+}
+
 /**
  * OpenRouter accepted the request and found nowhere to send it: the account's
  * data policy or guardrail settings exclude every provider serving the picked
@@ -263,6 +297,18 @@ export function isOpenRouterKeyLimitExceeded(text: string): boolean {
 }
 
 /**
+ * the provider was reached with NO credential at all — the AI SDK's shared `loadApiKey`
+ * refusal, so it is provider-agnostic. NOT `isApiKeyAuthError`, which is a key we hold
+ * being rejected: "rotate your key" names a credential that does not exist here.
+ */
+export function isProviderMissingCredential(text: string): boolean {
+  return (
+    /API key is missing\. Pass it using the/i.test(text) ||
+    /Missing Authentication header/i.test(text)
+  );
+}
+
+/**
  * The upstream is having a moment: Anthropic's `API Error: 529 Overloaded`,
  * OpenRouter's `provider_unavailable` / `timeout`, OpenCode Zen's `Streaming
  * response failed: [5xx]`. Three transports, one condition — nothing the user
@@ -281,7 +327,9 @@ export function isTransientUpstreamError(text: string): boolean {
     /API Error:\s*5\d\d/i.test(text) ||
     /\bOverloaded\b/.test(text) ||
     /"error_type"\s*:\s*"(?:provider_unavailable|timeout)"/i.test(text) ||
-    /Streaming response failed:\s*\[5\d\d\]/i.test(text)
+    /Streaming response failed:\s*\[5\d\d\]/i.test(text) ||
+    // the Codex CLI's `Selected model is at capacity. Please try a different model.`
+    /\bmodel is at capacity\b/i.test(text)
   );
 }
 

@@ -49,6 +49,19 @@ interface NpmRegistryData {
 }
 
 /**
+ * The npm that launched this CLI through `npx`, run under our own node. A bare
+ * `npm` resolves the runner's `externals/node24/bin/npm` first (the bootstrap
+ * prepends that dir), and self-hosted pools ship it as a shim over a missing
+ * `lib/cli.js` — the same partial tree #1084 hit for `npx`. `normalizeEnv` has
+ * uppercased npx's `npm_execpath` by the time any install runs.
+ */
+function resolveNpm(): { command: string; args: string[] } {
+  const npmCli = process.env.NPM_EXECPATH;
+  if (npmCli?.endsWith("npm-cli.js")) return { command: process.execPath, args: [npmCli] };
+  return { command: "npm", args: [] };
+}
+
+/**
  * Install a CLI tool from an npm package tarball
  * Downloads the tarball, extracts it to a temp directory, and returns the path to the CLI executable
  * The temp directory will be cleaned up by the OS automatically
@@ -57,7 +70,14 @@ export async function installFromNpmTarball(params: InstallFromNpmTarballParams)
   const tempDir = process.env.PULLFROG_TEMP_DIR;
   if (!tempDir) throw new Error("PULLFROG_TEMP_DIR is not set");
 
-  const extractedDir = join(tempDir, "package");
+  // one extraction root per package. npm tarballs all unpack to `package/`, so a
+  // shared root leaves several CLIs interleaved in one tree and runs each
+  // `npm install --production` against the previous package's manifest — which
+  // prunes the earlier CLI's own dependencies. main.ts installs opencode for
+  // model introspection on every run, so this collides with whichever harness
+  // then installs.
+  const packageRoot = join(tempDir, `npm-${params.packageName.replace(/[^a-z0-9]+/gi, "-")}`);
+  const extractedDir = join(packageRoot, "package");
   const cliPath = join(extractedDir, params.executablePath);
 
   if (existsSync(cliPath)) {
@@ -92,7 +112,8 @@ export async function installFromNpmTarball(params: InstallFromNpmTarballParams)
 
   log.debug(`» installing ${params.packageName}@${resolvedVersion}...`);
 
-  const tarballPath = join(tempDir, "package.tgz");
+  mkdirSync(packageRoot, { recursive: true });
+  const tarballPath = join(packageRoot, "package.tgz");
 
   // Download tarball from npm
   const npmRegistry = process.env.NPM_REGISTRY || "https://registry.npmjs.org";
@@ -120,7 +141,7 @@ export async function installFromNpmTarball(params: InstallFromNpmTarballParams)
 
   // Extract tarball
   log.debug(`» extracting tarball...`);
-  const extractResult = spawnSync("tar", ["-xzf", tarballPath, "-C", tempDir], {
+  const extractResult = spawnSync("tar", ["-xzf", tarballPath, "-C", packageRoot], {
     stdio: "pipe",
     encoding: "utf-8",
   });
@@ -130,14 +151,11 @@ export async function installFromNpmTarball(params: InstallFromNpmTarballParams)
     );
   }
 
-  if (!existsSync(cliPath)) {
-    throw new Error(`Executable not found in extracted package at ${cliPath}`);
-  }
-
   // Install dependencies if requested
   if (params.installDependencies) {
     log.debug(`» installing dependencies for ${params.packageName}...`);
-    const installResult = spawnSync("npm", ["install", "--production"], {
+    const npm = resolveNpm();
+    const installResult = spawnSync(npm.command, [...npm.args, "install", "--production"], {
       cwd: extractedDir,
       stdio: "pipe",
       encoding: "utf-8",
@@ -154,6 +172,14 @@ export async function installFromNpmTarball(params: InstallFromNpmTarballParams)
       );
     }
     log.debug(`» dependencies installed`);
+  }
+
+  // checked AFTER the dependency install, not before: every CLI we pull this
+  // way ships its real executable in a platform optionalDependency, so the
+  // path only exists once `npm install` has run (claude's postinstall copies
+  // over a stub, codex's vendor dir isn't in the base tarball at all).
+  if (!existsSync(cliPath)) {
+    throw new Error(`Executable not found in extracted package at ${cliPath}`);
   }
 
   // Make the file executable

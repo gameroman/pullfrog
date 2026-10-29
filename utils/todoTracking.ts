@@ -1,3 +1,4 @@
+import { TODO_SPINNER_URL } from "./leapingComment.ts";
 import { log } from "./log.ts";
 
 type TodoItem = {
@@ -39,7 +40,7 @@ function renderTodoMarkdown(todos: TodoItem[]): string {
         case "cancelled":
           return `- ~~${todo.content}~~`;
         case "in_progress":
-          return `- [ ] <img src="https://uploads.pullfrog.com/Progress%20Indicator.gif"  width="11" style="visibility: visible; max-width: 100%;" />  ${todo.content}`;
+          return `- [ ] <img src="${TODO_SPINNER_URL}"  width="11" style="visibility: visible; max-width: 100%;" />  ${todo.content}`;
         case "pending":
           return `- [ ] ${todo.content}`;
         default:

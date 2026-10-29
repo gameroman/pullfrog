@@ -39,11 +39,16 @@ function resolveModelForLog(ctx: {
 function resolveEffortForLog(ctx: {
   payload: ResolvedPayload;
   resolvedModel: string | undefined;
+  agentName: string;
 }): string {
   const effort = resolveRunEffort(ctx);
   // this block prints before the agent starts, so an auto-select run has no
   // model yet — the harness prints the real rung once it picks one.
   if (!ctx.resolvedModel && !ctx.payload.proxyModel) return "pending — model not chosen yet";
+  // likewise the opencode server, whose declared variants stand in for a ladder.
+  if (effort.declarable && ctx.agentName === "opencode") {
+    return "pending — reading the variants opencode declares";
+  }
   if (!effort.alias) return "not applied — model not recognized";
   if (!effort.rung) return "n/a (model has no effort control)";
   return effort.configured ? effort.rung : `${effort.rung} (default)`;
@@ -72,9 +77,13 @@ export function logRunStartup(ctx: {
   log.info(
     `» model:   ${resolveModelForLog({ payload: ctx.payload, resolvedModel: ctx.resolvedModel })}`
   );
-  log.info(
-    `» effort:  ${resolveEffortForLog({ payload: ctx.payload, resolvedModel: ctx.resolvedModel })}`
-  );
+  log.info(`» effort:  ${resolveEffortForLog(ctx)}`);
+  const routing = ctx.payload.routing;
+  if (routing) {
+    log.info(
+      `» routed:  ${routing.tier} (${routing.source}: stakes ${routing.stakes}, workload ${routing.workload}) — ${routing.rationale}`
+    );
+  }
   log.info(
     `» agent:   ${resolveAgentForLog({ agentName: ctx.agentName, resolvedModel: ctx.resolvedModel })}`
   );

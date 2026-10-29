@@ -19,10 +19,14 @@
  *   - 404 → `TransientError` (stale repo↔account link — re-homes on next webhook)
  */
 
-import * as core from "@actions/core";
-import { DEFAULT_PROXY_MODEL, isCardGatedModel, resolveOpenRouterModel } from "../models.ts";
+import * as yes from "yes";
+import {
+  DEFAULT_PROXY_MODEL,
+  isCardGatedModel,
+  resolveOpenRouterModel,
+  TRIAL_PROXY_MODEL,
+} from "../models.ts";
 import type { ToolState } from "../toolState.ts";
-import * as yes from "../yes/index.ts";
 import { apiFetch } from "./apiFetch.ts";
 import { isLocalApiUrl } from "./apiUrl.ts";
 import {
@@ -35,11 +39,16 @@ import { log, writeSummary } from "./cli.ts";
 import { reportErrorToComment } from "./errorReport.ts";
 import { fetchIdTokenFromStash, isTransientTokenError, type OidcCredentials } from "./github.ts";
 import type { ResolvedPayload } from "./payload.ts";
+import { maskSecret } from "./secretCommands.ts";
+
+/** which program pays for the minted key. the server re-derives entitlement for
+ * every value of this — it is a request, never a claim. */
+type FundingSource = "oss" | "router" | "trial";
 
 async function mintProxyKey(ctx: {
   oidcCredentials: OidcCredentials | null;
   repo: { owner: string; name: string };
-  oss: boolean;
+  fundingSource: FundingSource;
 }): Promise<string | null> {
   try {
     const headers = await buildProxyTokenHeaders(ctx);
@@ -53,23 +62,22 @@ async function mintProxyKey(ctx: {
     // the provider key the grant exists to replace (#1192). retry, then render
     // the "temporarily unavailable" copy instead of the "billing error" label
     // BillingError uses.
-    const response = await yes.op(
-      async () => {
+    const response = await yes.mutation({
+      run: async () => {
         const r = await apiFetch({ path: "/api/proxy-token", method: "POST", headers });
         if (r.status >= 500) {
           const body = (await r.json().catch(() => null)) as { error?: string } | null;
+          log.warning(`proxy key mint: ${r.status} ${body?.error ?? ""}`);
           throw new TransientError(
-            body?.error ?? "billing service temporarily unavailable — retry shortly"
+            "Pullfrog's billing service is temporarily unavailable, so this run didn't start."
           );
         }
         return r;
       },
-      {
-        name: "proxy key mint",
-        retries: [1000, 2000],
-        bail: (error) => !(error instanceof TransientError),
-      }
-    )();
+      name: "proxy key mint",
+      retry: (error, attempt) =>
+        error instanceof TransientError ? yes.backoff([1000, 2000], attempt) : -1,
+    })();
 
     if (response.status === 402) {
       const body = (await response.json().catch(() => null)) as {
@@ -91,7 +99,8 @@ async function mintProxyKey(ctx: {
     // error would misdirect the user to add a provider key (the ccusage churn).
     if (response.status === 404) {
       throw new TransientError(
-        "Pullfrog couldn't match this repository to its account — it may have just been renamed or transferred. The link refreshes automatically on the next run; if it keeps failing, reinstall the GitHub App on the repo's current owner."
+        "Pullfrog couldn't match this repository to its account.",
+        "It may have just been renamed or transferred, and the link refreshes on the next run. If it keeps failing, reinstall the GitHub App on the repository's current owner."
       );
     }
 
@@ -131,17 +140,18 @@ async function mintProxyKey(ctx: {
 async function buildProxyTokenHeaders(ctx: {
   oidcCredentials: OidcCredentials | null;
   repo: { owner: string; name: string };
-  oss: boolean;
+  fundingSource: FundingSource;
 }): Promise<Record<string, string> | null> {
-  const fundingSource = ctx.oss ? "oss" : "router";
+  const fundingSource = ctx.fundingSource;
   if (ctx.oidcCredentials) {
     // retry transients — core.getIDToken (the previous mint path) retried
     // 5xx internally, and a soft-skip here degrades the run to BYOK
     const creds = ctx.oidcCredentials;
-    const oidcToken = await yes.op(() => fetchIdTokenFromStash(creds), {
+    const oidcToken = await yes.query({
+      run: () => fetchIdTokenFromStash(creds),
       name: "ID token mint",
-      retries: [1000, 2000],
-      bail: (error) => !isTransientTokenError(error),
+      retry: (error, attempt) =>
+        isTransientTokenError(error) ? yes.backoff([1000, 2000], attempt) : -1,
     })();
     return {
       Authorization: `Bearer ${oidcToken}`,
@@ -201,12 +211,12 @@ async function resolveProxyModel(ctx: {
   const key = await mintProxyKey({
     oidcCredentials: ctx.oidcCredentials,
     repo: ctx.repo,
-    oss: ctx.oss,
+    fundingSource: ctx.oss ? "oss" : "router",
   });
   if (!key) return;
 
   process.env.OPENROUTER_API_KEY = key;
-  core.setSecret(key);
+  maskSecret(key);
   ctx.payload.proxyModel = ctx.proxyModel;
   // reflect the effective (proxy) model now — an error comment built between
   // here and main.ts's post-resolution refinement would otherwise show the
@@ -329,7 +339,7 @@ export async function runProxyResolution(ctx: {
       throw error;
     }
     if (error instanceof TransientError) {
-      const summary = formatTransientErrorSummary(error, ctx.repo.owner);
+      const summary = formatTransientErrorSummary(error);
       await writeSummary(summary).catch(() => {});
       await reportErrorToComment({
         toolState: ctx.toolState,
@@ -340,4 +350,54 @@ export async function runProxyResolution(ctx: {
     }
     throw error;
   }
+}
+
+/**
+ * Late fallback for a run inside the no-card trial whose own key search came up
+ * dry. Mints a Pullfrog-funded key on the efficient tier so a new account's
+ * first run produces a review rather than a credentials error.
+ *
+ * Deliberately runs AFTER `validateAgentApiKey` rather than beside the ordinary
+ * proxy resolution: the server grants permission but cannot see workflow `env:`
+ * keys, so only the runner knows whether anything else could have paid. Minting
+ * eagerly would silently downgrade every account whose key lives in GitHub
+ * Actions secrets.
+ *
+ * Returns false when the mint is unavailable (no OIDC, server declined), leaving
+ * the caller to raise the original missing-key error unchanged.
+ */
+export async function resolveTrialFallback(ctx: {
+  payload: ResolvedPayload;
+  configuredModel: string | undefined;
+  creditsLeftUsd: number | undefined;
+  oidcCredentials: OidcCredentials | null;
+  repo: { owner: string; name: string };
+  toolState: ToolState;
+}): Promise<boolean> {
+  // an explicit operator override is a deliberate pin — usually set to
+  // REPRODUCE a credential failure — so silently serving it from the subsidy
+  // would mask the very run it was set to produce.
+  if (process.env.PULLFROG_MODEL?.trim()) return false;
+  if (!ctx.oidcCredentials && !isLocalApiUrl()) return false;
+
+  const key = await mintProxyKey({
+    oidcCredentials: ctx.oidcCredentials,
+    repo: ctx.repo,
+    fundingSource: "trial",
+  });
+  if (!key) return false;
+
+  process.env.OPENROUTER_API_KEY = key;
+  maskSecret(key);
+  ctx.payload.proxyModel = TRIAL_PROXY_MODEL;
+  ctx.toolState.model = TRIAL_PROXY_MODEL;
+  // `from` is what the repo was configured to use, so the disclosure can name
+  // what did NOT run. absent when the repo never picked a model at all.
+  ctx.toolState.modelClamped = {
+    from: ctx.configuredModel ?? TRIAL_PROXY_MODEL,
+    reason: "trial",
+    creditsLeftUsd: ctx.creditsLeftUsd,
+  };
+  log.info(`» proxy: trial → ${TRIAL_PROXY_MODEL}`);
+  return true;
 }

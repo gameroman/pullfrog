@@ -90,6 +90,23 @@ export function hasPostRunIssues(issues: PostRunIssues): boolean {
  * cache hit ratio at a glance. Dashboards that query `WorkflowRun.inputTokens`
  * directly are seeing the full total, not the log column.
  */
+/**
+ * Which credential actually paid for a run.
+ *
+ * `subscription` is the one that changes what a cost figure MEANS: a Claude
+ * Pro/Max or ChatGPT subscription moves no per-token money, so a dollar figure
+ * on such a run is what it WOULD have cost on the API, not spend. Without this
+ * recorded, `WorkflowRun.costUsd` silently mixes the two and there is no way
+ * after the fact to separate them.
+ */
+export type AgentCredential =
+  | "subscription"
+  | "api_key"
+  | "gateway"
+  | "bedrock"
+  | "vertex"
+  | "foundry";
+
 export interface AgentUsage {
   agent: string;
   /** full billable input: non-cached + cache read + cache write */
@@ -161,6 +178,13 @@ export interface AgentRunContext {
    * server) so lingering SSE reconnects don't keep the outer timer alive.
    */
   onActivityTimeout?: (() => void) | undefined;
+  /**
+   * called when an aborted turn actually comes back and the harness intends to
+   * keep going. stands down the safety-net timer `onActivityTimeout` armed, so
+   * it only ever guards the window where an abort might have been ignored
+   * rather than force-exiting a run mid-salvage. see #1085.
+   */
+  onTurnRecovered?: (() => void) | undefined;
   onToolUse?: ((event: AgentToolUseEvent) => void) | undefined;
   /**
    * Pullfrog API JWT scoped to this run. agents only need this when they

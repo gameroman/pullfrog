@@ -57,7 +57,7 @@ describe("validateAgentApiKey — opencode", () => {
         owner,
         name,
       })
-    ).toThrow("no API key found");
+    ).toThrow("No API key found");
   });
 
   // `opencode models` can exit 0 having printed only an alphabetical prefix of
@@ -69,7 +69,7 @@ describe("validateAgentApiKey — opencode", () => {
     expect(() =>
       validateAgentApiKey({
         agent: opencode,
-        model: "openrouter/openai/gpt-5.6-sol",
+        model: "openrouter/openai/gpt-6.1-sol",
         authorized: new Set([
           "openrouter/anthropic/claude-opus-5",
           "openrouter/google/gemma-3-12b",
@@ -84,25 +84,25 @@ describe("validateAgentApiKey — opencode", () => {
     expect(() =>
       validateAgentApiKey({
         agent: opencode,
-        model: "openrouter/openai/gpt-5.6-sol",
+        model: "openrouter/openai/gpt-6.1-sol",
         authorized: new Set(["openrouter/anthropic/claude-opus-5"]),
         owner,
         name,
       })
-    ).toThrow("no API key found");
+    ).toThrow("No API key found");
   });
 
   it("blames the fetch, not the user, when stored secrets were unreadable", () => {
     expect(() =>
       validateAgentApiKey({
         agent: opencode,
-        model: "openrouter/openai/gpt-5.6-sol",
+        model: "openrouter/openai/gpt-6.1-sol",
         authorized: new Set(),
         owner,
         name,
         secretsUnavailable: true,
       })
-    ).toThrow("couldn't load your Pullfrog secrets");
+    ).toThrow("couldn't load your stored secrets");
   });
 
   it("passes the auto-select path when an authorized model's key is present", () => {
@@ -130,7 +130,7 @@ describe("validateAgentApiKey — opencode", () => {
         owner,
         name,
       })
-    ).toThrow("no API key found");
+    ).toThrow("No API key found");
   });
 
   // `openai` is the one provider whose credential can live in
@@ -142,7 +142,7 @@ describe("validateAgentApiKey — opencode", () => {
       validateAgentApiKey({
         agent: opencode,
         model: undefined,
-        authorized: new Set(["openai/gpt-5.6-sol"]),
+        authorized: new Set(["openai/gpt-6.1-sol"]),
         owner,
         name,
       })
@@ -159,7 +159,7 @@ describe("validateAgentApiKey — opencode", () => {
         name,
         routerUnfunded: true,
       })
-    ).toThrow("your Pullfrog Router balance is empty");
+    ).toThrow("Your Pullfrog Router balance is empty");
   });
 
   it("throws the auto-select path when the authorized set is empty", () => {
@@ -171,7 +171,7 @@ describe("validateAgentApiKey — opencode", () => {
         owner,
         name,
       })
-    ).toThrow("no API key found");
+    ).toThrow("No API key found");
   });
 });
 
@@ -211,7 +211,7 @@ describe("validateAgentApiKey — claude (static Anthropic check)", () => {
         owner,
         name,
       })
-    ).toThrow("no API key found");
+    ).toThrow("No API key found");
   });
 });
 
@@ -301,7 +301,7 @@ describe("validateAgentApiKey — Vertex routing", () => {
 
 describe("isApiKeyAuthError", () => {
   it("matches the missing-key marker thrown by validateAgentApiKey", () => {
-    expect(isApiKeyAuthError("no API key found. Pullfrog needs ...")).toBe(true);
+    expect(isApiKeyAuthError("No API key found. Pullfrog needs ...")).toBe(true);
   });
 
   it("matches Claude CLI 401 strings", () => {
@@ -350,6 +350,12 @@ describe("isApiKeyAuthError", () => {
         "provider error: Your authentication token has been invalidated. Please try signing in again."
       )
     ).toBe(true);
+    // #1474 the reversed word order
+    expect(
+      isApiKeyAuthError(
+        "provider error: Encountered invalidated oauth token for user, failing request"
+      )
+    ).toBe(true);
     // #1162 the value is unsendable, not wrong — a line-wrapped paste
     expect(isApiKeyAuthError("API Error: Header '14' has invalid value: '***'")).toBe(true);
     // #1180 OpenAI writes the copula as "is", not "has"
@@ -380,12 +386,11 @@ describe("formatApiKeyErrorSummary", () => {
     const msg = formatApiKeyErrorSummary({
       owner: "acme",
       name: "repo",
-      raw: "no API key found in this run",
+      raw: "No API key found in this run",
     });
-    expect(msg).toContain("no API key found");
-    expect(msg).toContain("https://github.com/acme/repo/settings/secrets/actions");
+    expect(msg).toContain("**No API key found.**");
+    expect(msg).toContain("/console/acme#billing");
     expect(msg).toContain("/console/acme/repo");
-    expect(msg).toContain("https://discord.gg/8y96raFg8e");
   });
 
   it("renders the invalid-key body for any other auth error", () => {
@@ -396,7 +401,11 @@ describe("formatApiKeyErrorSummary", () => {
     });
     expect(msg).toContain("rejected");
     expect(msg).toContain("https://github.com/acme/repo/settings/secrets/actions");
-    expect(msg).toContain("https://discord.gg/8y96raFg8e");
+    // the key may live in Pullfrog's store instead, and only one of the two CTAs
+    // can be right — so both have to be offered. assert the LABEL: the sibling
+    // `Model settings` link is `/console/acme/repo`, so a bare `/console/acme`
+    // substring passes against copy that never gained the store link at all.
+    expect(msg).toContain("[Pullfrog provider settings →](");
   });
 
   // see #931 — OAuth-connection credentials aren't repo secrets, so the
@@ -407,7 +416,7 @@ describe("formatApiKeyErrorSummary", () => {
       name: "repo",
       raw: "» Pullfrog session error: Token refresh failed: 401",
     });
-    expect(msg).toContain("OAuth credential has expired");
+    expect(msg).toContain("sign-in has expired or been revoked");
     expect(msg).toContain("pullfrog auth");
     expect(msg).not.toContain("settings/secrets/actions");
     // #1072 — this shape rendered the rotate-your-repo-secret copy before
@@ -416,7 +425,7 @@ describe("formatApiKeyErrorSummary", () => {
       name: "repo",
       raw: "Failed to authenticate. API Error: 401 OAuth access token has expired. Re-authenticate to continue.",
     });
-    expect(claudeCli).toContain("OAuth credential has expired");
+    expect(claudeCli).toContain("sign-in has expired or been revoked");
     expect(claudeCli).not.toContain("settings/secrets/actions");
   });
 
@@ -428,9 +437,9 @@ describe("formatApiKeyErrorSummary", () => {
       name: "repo",
       raw: "Your organization has disabled Claude subscription access for Claude Code · Use an Anthropic API key instead, or ask your admin to enable access",
     });
-    expect(msg).toContain("disabled Claude subscription access");
-    expect(msg).toContain("ANTHROPIC_API_KEY");
-    expect(msg).not.toContain("OAuth credential has expired");
+    expect(msg).toContain("doesn't allow subscription sign-in for Claude Code");
+    expect(msg).toContain("Anthropic API key");
+    expect(msg).not.toContain("sign-in has expired");
     expect(msg).not.toContain("was rejected");
   });
 });

@@ -27,13 +27,7 @@ export const test: TestRunnerOptions = {
   env: {
     PULLFROG_DISABLE_SECURITY_INSTRUCTIONS: "1",
     PULLFROG_MODEL: "vertex/byok",
-    VERTEX_MODEL_ID: "gemini-2.5-flash",
+    VERTEX_MODEL_ID: "gemini-3.8-flash",
     VERTEX_LOCATION: "global",
   },
-  coverage: [
-    "action/models.ts",
-    "action/main.ts",
-    "action/agents/opencode.ts",
-    "action/utils/{agent,apiKeys,vertex}.ts",
-  ],
 };

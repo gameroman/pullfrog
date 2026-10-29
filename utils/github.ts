@@ -4,9 +4,9 @@ import { dirname, join } from "node:path";
 import * as core from "@actions/core";
 import { throttling } from "@octokit/plugin-throttling";
 import { Octokit } from "@octokit/rest";
-import * as yes from "../yes/index.ts";
+import * as yes from "yes";
 import { apiFetch } from "./apiFetch.ts";
-import { isGitHubActions } from "./globals.ts";
+import { maskSecret } from "./secretCommands.ts";
 
 /** OIDC audience for Pullfrog API token exchanges */
 const OIDC_AUDIENCE = "pullfrog-api";
@@ -106,6 +106,12 @@ export type GitHubAppPermissions = {
 
 type AcquireTokenOptions = {
   repos?: string[] | undefined;
+  /**
+   * handle to the server-persisted cross-repo grant, required whenever `repos`
+   * names anything beyond the primary. the server bounds the request against
+   * the sets IT stored, so this cannot widen the token by itself.
+   */
+  xrepoGrant?: string | undefined;
   permissions?: GitHubAppPermissions;
   /**
    * stashed OIDC credentials for minting after restricted mode deletes
@@ -165,9 +171,7 @@ export async function fetchIdTokenFromStash(creds: OidcCredentials): Promise<str
   if (!body.value) {
     throw new Error("ID token response has no value field");
   }
-  if (isGitHubActions) {
-    core.setSecret(body.value);
-  }
+  maskSecret(body.value);
   return body.value;
 }
 
@@ -197,16 +201,17 @@ function translateIdTokenError(error: unknown): unknown {
  * own retry still re-mints. Mid-run refreshes take the stashed-credentials path
  * (`opts.oidc`) and deliberately bypass this.
  */
-export const mintIdToken = yes.op(
-  async () => {
+export const mintIdToken = yes.query({
+  run: async () => {
     try {
       return await core.getIDToken(OIDC_AUDIENCE);
     } catch (error) {
       throw translateIdTokenError(error);
     }
   },
-  { ttl: 60_000, name: "OIDC ID token" }
-);
+  ttl: 60_000,
+  name: "OIDC ID token",
+});
 
 async function acquireTokenViaOIDC(opts?: AcquireTokenOptions): Promise<string> {
   const oidcToken = opts?.oidc ? await fetchIdTokenFromStash(opts.oidc) : await mintIdToken();
@@ -229,6 +234,7 @@ async function acquireTokenViaOIDC(opts?: AcquireTokenOptions): Promise<string> 
       headers: {
         Authorization: `Bearer ${oidcToken}`,
         "Content-Type": "application/json",
+        ...(opts?.xrepoGrant ? { "x-pullfrog-xrepo-grant": opts.xrepoGrant } : {}),
       },
       body: opts?.permissions ? JSON.stringify({ permissions: opts.permissions }) : undefined,
       signal: controller.signal,
@@ -472,10 +478,11 @@ export function isTransientTokenError(error: unknown): boolean {
 
 export async function acquireNewToken(opts?: AcquireTokenOptions): Promise<string> {
   if (opts?.oidc || isOIDCAvailable()) {
-    return await yes.op(() => acquireTokenViaOIDC(opts), {
+    return await yes.mutation({
+      run: () => acquireTokenViaOIDC(opts),
       name: "token exchange",
-      retries: [1000, 2000],
-      bail: (error) => !isTransientTokenError(error),
+      retry: (error, attempt) =>
+        isTransientTokenError(error) ? yes.backoff([1000, 2000], attempt) : -1,
     })();
   }
   // running inside GitHub Actions but the OIDC env vars are absent — the

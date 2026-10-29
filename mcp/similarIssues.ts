@@ -1,4 +1,5 @@
 import { type } from "arktype";
+import { primaryRepoState } from "../toolState.ts";
 import { apiFetch } from "../utils/apiFetch.ts";
 import type { ToolContext } from "./server.ts";
 import { execute, tool } from "./shared.ts";
@@ -15,8 +16,12 @@ export function SimilarIssuesTool(ctx: ToolContext) {
     mutates: true,
     parameters: SimilarIssues,
     execute: execute(async (input) => {
-      if (ctx.payload.event.is_pr || ctx.payload.event.issue_number !== input.issue_number) {
-        throw new Error("find_similar_issues is limited to the issue that triggered this run");
+      // a run with no target adopts the first issue it asks about, keeping on-demand index writes to one
+      const repoState = primaryRepoState(ctx.toolState);
+      repoState.issueNumber ??= input.issue_number;
+      const subject = ctx.payload.event.issue_number ?? repoState.issueNumber;
+      if (ctx.payload.event.is_pr || subject !== input.issue_number) {
+        throw new Error(`find_similar_issues is limited to this run's issue, #${subject}`);
       }
       const response = await apiFetch({
         path: `/api/repo/${ctx.repo.owner}/${ctx.repo.name}/issues/${input.issue_number}/similar`,

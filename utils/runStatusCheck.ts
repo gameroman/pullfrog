@@ -41,7 +41,7 @@ export const RUN_STATUS_CHECK_NAME = "pullfrog";
  * available: it was tried on 2026-08-02 and blocked merges on four customer
  * repos (see above), so the reuse lookup filters instead. See #1196.
  */
-const GITHUB_ACTIONS_APP_SLUG = "github-actions";
+export const GITHUB_ACTIONS_APP_SLUG = "github-actions";
 
 /** the review-verdict check. opt-in, terminal-only, and deliberately separate from the above. */
 export const APPROVAL_CHECK_NAME = "pullfrog-approval";
@@ -143,12 +143,24 @@ const IN_PROGRESS_OUTPUT = {
 /**
  * Repo console deep-link, anchored at the Review PRs card that holds the toggle. Origin is
  * hardcoded to match `billingErrors.ts`, the established pattern for console links from the
- * action. Appended to every non-success summary so a user whose merge is blocked by a check
- * they never asked for can reach the off switch from the check itself.
+ * action. Appended last to every non-success summary so a user whose merge is blocked by a
+ * check they never asked for can reach the off switch — but a one-off failure must not read
+ * as "the remedy is to turn this off", so the link names the exact toggle and never leads.
  */
 function disableCheckLine(owner: string, repo: string): string {
   const url = `https://pullfrog.com/console/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}#auto-review-prs`;
-  return `\n\n[Turn off this check →](${url}) — it reports run status only and gates nothing unless you required it in branch protection.`;
+  return `\n\nThis check reports run status only and gates nothing unless you required it in branch protection. [Turn off the run status check →](${url})`;
+}
+
+/**
+ * The logs link. GitHub renders `details_url` as "View more details on Pullfrog" whatever it
+ * points at, so a summary that says "see the run logs" without linking them leaves the user
+ * with no visible way to reach them (measured on a real failed check: the only link in the
+ * panel was the off switch). Every finalizer's `detailsUrl` is the Actions run or the
+ * pullfrog.com shortlink that redirects to it; undefined means no run ever existed.
+ */
+function logsLine(detailsUrl: string | undefined): string {
+  return detailsUrl ? `\n\n[View the run logs →](${detailsUrl})` : "";
 }
 
 const TERMINAL_OUTPUT: Record<RunStatusCheckConclusion, { title: string; summary: string }> = {
@@ -158,7 +170,7 @@ const TERMINAL_OUTPUT: Record<RunStatusCheckConclusion, { title: string; summary
   },
   failure: {
     title: "Pullfrog run failed",
-    summary: "The Pullfrog run failed. See the run logs for details.",
+    summary: "The Pullfrog run failed.",
   },
   cancelled: {
     title: "Pullfrog run cancelled",
@@ -166,11 +178,11 @@ const TERMINAL_OUTPUT: Record<RunStatusCheckConclusion, { title: string; summary
   },
   timed_out: {
     title: "Pullfrog run timed out",
-    summary: "The Pullfrog run exceeded its timeout. See the run logs for details.",
+    summary: "The Pullfrog run exceeded its timeout.",
   },
   action_required: {
     title: "Pullfrog run needs attention",
-    summary: "The Pullfrog run stopped and needs attention. See the run logs for details.",
+    summary: "The Pullfrog run stopped and needs attention.",
   },
   neutral: {
     title: "Pullfrog run finished",
@@ -183,15 +195,17 @@ const TERMINAL_OUTPUT: Record<RunStatusCheckConclusion, { title: string; summary
 };
 
 /**
- * Terminal output for a conclusion. A non-success carries the console deep-link: that is the
- * moment a user is most likely to want the check gone, and a check whose only affordance is
- * "View details" gives them nowhere to go.
+ * Terminal output for a conclusion. A non-success links the run logs first — that is what a
+ * failed check is for — then the review, and only then the console deep-link, so the off
+ * switch is reachable from a check the user never asked for without being the headline.
  */
 function terminalOutput(params: {
   conclusion: RunStatusCheckConclusion;
   owner: string;
   repo: string;
+  detailsUrl: string | undefined;
   reviewUrl: string | undefined;
+  note: string | undefined;
 }): { title: string; summary: string } {
   const base = TERMINAL_OUTPUT[params.conclusion];
   // `details_url` can only carry one destination, so the rest go here — the summary is
@@ -200,9 +214,18 @@ function terminalOutput(params: {
   const review = params.reviewUrl
     ? `\n\n[View the review Pullfrog posted →](${params.reviewUrl})`
     : "";
-  const disable =
-    params.conclusion === "success" ? "" : disableCheckLine(params.owner, params.repo);
-  return { title: base.title, summary: base.summary + review + disable };
+  if (params.conclusion === "success") {
+    const note = params.note ? `\n\n${params.note}` : "";
+    return { title: base.title, summary: base.summary + review + note };
+  }
+  return {
+    title: base.title,
+    summary:
+      base.summary +
+      logsLine(params.detailsUrl) +
+      review +
+      disableCheckLine(params.owner, params.repo),
+  };
 }
 
 /**
@@ -272,6 +295,8 @@ export async function finalizeRunStatusCheck(params: {
   conclusion: RunStatusCheckConclusion;
   detailsUrl: string | undefined;
   reviewUrl?: string | undefined;
+  /** the run's own final report, shown on success when nothing else carries it. */
+  note?: string | undefined;
 }): Promise<void> {
   const updateParams: UpdateCheckRunParams = {
     owner: params.owner,
@@ -283,7 +308,9 @@ export async function finalizeRunStatusCheck(params: {
       conclusion: params.conclusion,
       owner: params.owner,
       repo: params.repo,
+      detailsUrl: params.detailsUrl,
       reviewUrl: params.reviewUrl,
+      note: params.note,
     }),
   };
   if (params.detailsUrl) updateParams.details_url = params.detailsUrl;
@@ -305,6 +332,7 @@ export async function createTerminalRunStatusCheck(params: {
   conclusion: RunStatusCheckConclusion;
   detailsUrl: string | undefined;
   reviewUrl?: string | undefined;
+  note?: string | undefined;
 }): Promise<void> {
   const createParams: CreateCheckRunParams = {
     owner: params.owner,
@@ -317,7 +345,9 @@ export async function createTerminalRunStatusCheck(params: {
       conclusion: params.conclusion,
       owner: params.owner,
       repo: params.repo,
+      detailsUrl: params.detailsUrl,
       reviewUrl: params.reviewUrl,
+      note: params.note,
     }),
   };
   if (params.detailsUrl) createParams.details_url = params.detailsUrl;

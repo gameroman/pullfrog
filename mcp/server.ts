@@ -48,6 +48,7 @@ import {
   ListPullRequestReviewsTool,
   ResolveReviewThreadTool,
 } from "./reviewComments.ts";
+import { SearchIssuesTool } from "./searchIssues.ts";
 import { SelectModeTool } from "./selectMode.ts";
 import { addTools, type PullfrogTool } from "./shared.ts";
 import { KillBackgroundTool, ShellTool } from "./shell.ts";
@@ -80,8 +81,11 @@ export interface ToolContext {
   apiToken: string;
   modes: Mode[];
   postCheckoutScript: string | null;
+  botLogin: string;
+  botUserId: string;
   prepushScript: string | null;
   prApproveEnabled: boolean;
+  reviewDrafts: boolean;
   // globally-gated server-side (run-context ANDs the per-repo toggle with the
   // `isAutonomousMaintenanceEnabled()` kill switch). gates the run-end
   // autoMergeAfterApprove lifecycle action — there is deliberately NO
@@ -101,7 +105,7 @@ export interface ToolContext {
   // runtime context for existing consumers and observability.
   oss: boolean;
   plan: AccountPlan;
-  // resolved upstream model specifier (e.g. "google/gemini-3.1-pro-preview").
+  // resolved upstream model specifier (e.g. "google/gemini-4-argon").
   // undefined when payload.proxyModel is set or when the alias is unresolvable.
   // used by the schema sanitizer to detect Gemini-routed traffic.
   resolvedModel: string | undefined;
@@ -171,8 +175,12 @@ function buildCommonTools(ctx: ToolContext, outputSchema?: JsonSchema): Pullfrog
     RemoveLabelsTool(ctx),
     GitTool(ctx),
     GitFetchTool(ctx),
-    UploadFileTool(ctx),
   ];
+
+  // uploads are signed against the API token, which run-context issues only with OIDC
+  if (ctx.apiToken) {
+    tools.push(UploadFileTool(ctx));
+  }
 
   // cross-repo tools only surface on --xrepo runs (keeps the single-repo tool
   // list unchanged). list_repos + checkout_repo gate further on ctx.xrepo.
@@ -183,14 +191,18 @@ function buildCommonTools(ctx: ToolContext, outputSchema?: JsonSchema): Pullfrog
   if (hasSimilarIssues({ repoIntelligence: ctx.repoIntelligence, event: ctx.payload.event })) {
     tools.push(SimilarIssuesTool(ctx));
   }
+  if (!ctx.payload.event.is_pr) {
+    tools.push(SearchIssuesTool(ctx));
+  }
 
   const isStandalone = ctx.payload.event.trigger === "unknown";
   if (isStandalone || outputSchema) {
     tools.push(SetOutputTool(ctx, outputSchema));
   }
 
-  // MCP shell with filtered env (no secrets leaked to child processes)
-  if (ctx.payload.shell === "restricted") {
+  // sandboxed in CI, env filtered unless shell is "enabled". claude code and opencode deny their
+  // native shells, so this is their only one
+  if (ctx.payload.shell !== "disabled") {
     tools.push(ShellTool(ctx));
     tools.push(KillBackgroundTool(ctx));
   }

@@ -1,5 +1,39 @@
 import { describe, expect, it } from "vitest";
-import { getModelEnvVars, modelAliases, resolveCliModel, resolveDisplayAlias } from "../models.ts";
+import {
+  getModelEnvVars,
+  modelAliases,
+  resolveCliModel,
+  resolveDisplayAlias,
+  resolveModelRung,
+  resolveOpenRouterModel,
+} from "../models.ts";
+
+describe("GPT Astra routing and effort", () => {
+  it.each([
+    ["openai", "openai"],
+    ["opencode", "opencode"],
+    ["openrouter", "openrouter/openai"],
+    ["vercel", "vercel/openai"],
+  ])("resolves %s without offering disabled reasoning", (provider, route) => {
+    const slug = `${provider}/gpt-astra`;
+    expect(resolveCliModel(slug)).toBe(`${route}/gpt-6-astra`);
+    expect(resolveOpenRouterModel(slug)).toBe(
+      provider === "vercel" ? undefined : "openrouter/openai/gpt-6-astra"
+    );
+    for (const useOpenRouter of [false, true]) {
+      expect(resolveModelRung({ slug, useOpenRouter, position: 0 })).toBe("low");
+      expect(resolveModelRung({ slug, useOpenRouter, position: 1 })).toBe("max");
+    }
+  });
+});
+
+describe("OpenCode Go GLM Flash effort", () => {
+  it("omits direct effort while retaining the OpenRouter ladder", () => {
+    const slug = "opencode-go/glm-flash";
+    expect(resolveModelRung({ slug, useOpenRouter: false, position: 0.5 })).toBeUndefined();
+    expect(resolveModelRung({ slug, useOpenRouter: true, position: 0.5 })).toBe("high");
+  });
+});
 
 // ── pure alias-registry invariants ──────────────────────────────────────────────
 //
@@ -9,9 +43,39 @@ import { getModelEnvVars, modelAliases, resolveCliModel, resolveDisplayAlias } f
 // `pullfrog/models-bump` PRs (the bot's bump branch, gated in test.yml).
 
 // models that have no OpenRouter equivalent and require BYOK.
-// add a model here ONLY when it genuinely doesn't exist on both models.dev and OpenRouter.
+// add a model here ONLY when it genuinely doesn't exist on both models.dev and
+// OpenRouter — or, as with the vercel/* gateway aliases, when rerouting over
+// OpenRouter would defeat the pick: a Vercel AI Gateway alias exists to send
+// traffic through the user's own gateway (their observability, their billing),
+// so a Router-proxy equivalent is deliberately withheld and the picker locks
+// the entry until an AI_GATEWAY_API_KEY is stored.
 // the models-bump cron flags entries that become fillable (see rule 9 in models-bump.yml).
-const BYOK_ONLY_MODELS = new Set<string>([]);
+const BYOK_ONLY_MODELS = new Set<string>([
+  "vercel/claude-opus",
+  "vercel/claude-sonnet",
+  "vercel/claude-haiku",
+  "vercel/gpt-sol",
+  "vercel/gpt-astra",
+  "vercel/gpt-terra",
+  "vercel/gpt-luna",
+  "vercel/gemini-pro",
+  "vercel/gemini-flash",
+  "vercel/deepseek-pro",
+  "vercel/deepseek-flash",
+  "vercel/glm",
+  "vercel/kimi-k3",
+  "vercel/muse-spark",
+  "vercel/mistral-large",
+  // same reason as the vercel/* entries, one step further: these aliases exist
+  // to spend a Kimi MEMBERSHIP, and OpenRouter cannot resell one — its
+  // `moonshotai/*` ids are the pay-as-you-go route the user picked these to
+  // avoid. never fillable, so rule 9 can't reach them (the scanner exact-matches
+  // `kimi-for-coding/<id>`, which OpenRouter does not carry). see wiki/kimi-code.md.
+  "kimi-for-coding/kimi-k3",
+  "kimi-for-coding/kimi-k3-256k",
+  "kimi-for-coding/kimi-k2",
+  "kimi-for-coding/kimi-k2-highspeed",
+]);
 
 describe("openRouterResolve completeness", () => {
   for (const alias of modelAliases) {

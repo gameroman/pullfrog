@@ -15,7 +15,7 @@ export function GetIssueEventsTool(ctx: ToolContext) {
     parameters: GetIssueEvents,
     execute: execute(async ({ issue_number }) => {
       // set issue context
-      primaryRepoState(ctx.toolState).issueNumber = issue_number;
+      primaryRepoState(ctx.toolState).issueNumber ??= issue_number;
 
       const events = await ctx.octokit.paginate(ctx.octokit.rest.issues.listEventsForTimeline, {
         owner: ctx.repo.owner,

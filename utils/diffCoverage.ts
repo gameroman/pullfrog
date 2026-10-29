@@ -63,7 +63,9 @@ export function parseDiffTocEntries(params: { toc: string }): DiffTocEntry[] {
   // precomputed. accept that suffix optionally so we also parse the shorter
   // shape used in tests and in reviewComments.
   for (const line of lines) {
-    const match = line.match(/^- (.+) (?:→|->) lines (\d+)-(\d+)(?: · diff-[0-9a-f]+)?$/);
+    const match = line.match(
+      /^- (.+) (?:→|->) lines (\d+)-(\d+)(?: · diff-[0-9a-f]+)?(?: · generated)?$/
+    );
     if (!match) continue;
     const startLine = Number.parseInt(match[2], 10);
     const endLine = Number.parseInt(match[3], 10);
@@ -73,16 +75,35 @@ export function parseDiffTocEntries(params: { toc: string }): DiffTocEntry[] {
   return entries;
 }
 
+/**
+ * one entry per section of an incremental (range-diff) diff, which opens on an
+ * `@@ <file>[: <function>]` hunk header or a `## <file>[ (new)] ##` file header,
+ * either of which may be the only line naming its file.
+ */
+export function parseIncrementalDiffEntries(params: { content: string }): DiffTocEntry[] {
+  const lines = params.content.split("\n");
+  const entries: DiffTocEntry[] = [];
+  for (const [index, line] of lines.entries()) {
+    const match = line.match(/^@@ (.+)$|^[ +-]## (.+) ##$/);
+    if (!match) continue;
+    const previous = entries.at(-1);
+    if (previous) previous.endLine = index;
+    const filename = (match[1] ?? match[2]).replace(/(: | \().*$/, "");
+    entries.push({ filename, startLine: index + 1, endLine: lines.length });
+  }
+  return entries;
+}
+
 export function createDiffCoverageState(params: {
   diffPath: string;
   totalLines: number;
-  toc: string;
+  tocEntries: DiffTocEntry[];
   previous?: DiffCoverageState | undefined;
 }): DiffCoverageState {
   return {
     diffPath: params.diffPath,
     totalLines: params.totalLines,
-    tocEntries: parseDiffTocEntries({ toc: params.toc }),
+    tocEntries: params.tocEntries,
     coveredRanges: [],
     // carry forward across checkout_pr refreshes so the nudge stays "once per
     // review session". coveredRanges are intentionally not carried because

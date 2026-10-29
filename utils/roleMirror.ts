@@ -18,6 +18,20 @@ import type { GitHubAppPermissions } from "./github.ts";
  * permissions have no object granularity — so those runs get no token and use
  * the object-scoped MCP tools instead.
  *
+ * `role` is the triggerer's EFFECTIVE permission on THIS repo, and where it
+ * came from is deliberately not asked. `getCollaboratorPermissionLevel` already
+ * folds direct grants, team grants and the org base permission into one answer,
+ * so an org member who is `write` org-wide and a user with a single direct
+ * grant resolve identically — which is correct, because on this repo they can
+ * do the same things. Nothing in the action queries org membership.
+ *
+ * The token is then scoped to the current repo UNCONDITIONALLY: `resolveTokens`
+ * passes no `repos`, and `acquireTokenViaOIDC` always appends
+ * `$GITHUB_REPOSITORY`, so the list is exactly `[this repo]` even when the
+ * triggerer holds org-wide admin over hundreds. That asymmetry is deliberate
+ * margin — the invariant is "never MORE than the user has", and one repo out of
+ * many satisfies it with room to spare.
+ *
  * The set is a strict SUBSET of what any qualifying role holds, so the mirror
  * is one-directional by construction — it can never over-grant:
  *
@@ -29,8 +43,9 @@ import type { GitHubAppPermissions } from "./github.ts";
  *   wiki/autonomous-maintenance.md's "no injected instruction can cause a
  *   merge" still true. Legitimate pushes go through `push_branch`, which
  *   enforces the branch rules.
- * - `checks` is absent for the same class of reason: no human role grants it,
- *   and it would let the agent post its own passing `pullfrog-approval` status
+ * - `checks` is `read`, never `write`, for the same class of reason: every role
+ *   can read a PR's check runs, but no human role can write one, and write would
+ *   let the agent post its own passing `pullfrog-approval` status
  *   (see wiki/review-approval.md).
  * - Every qualifying role therefore receives the SAME set. The role decides
  *   whether a token is minted at all, not how wide it is — `admin`, `maintain`
@@ -46,7 +61,7 @@ export function mirrorRolePermissions(
     case "maintain":
     case "write":
     case "triage":
-      return { contents: "read", issues: "write", pull_requests: "write" };
+      return { checks: "read", contents: "read", issues: "write", pull_requests: "write" };
     case "read":
     case "none":
     case undefined:

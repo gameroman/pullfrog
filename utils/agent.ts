@@ -4,15 +4,19 @@ import {
   AZURE_DEPLOYMENT_ENV,
   AZURE_PROVIDER,
   BEDROCK_MODEL_ID_ENV,
+  CLAUDE_CODE_ONLY_CREDENTIALS,
   getModelProvider,
   isBedrockAnthropicId,
   isVertexAnthropicId,
-  OPENAI_COMPATIBLE_MODEL_ENV,
+  OPENAI_COMPATIBLE_FIELDS,
   OPENAI_COMPATIBLE_PROVIDER,
+  openAICompatibleEnv,
+  openAICompatibleSetName,
   resolveCliModel,
   resolveDisplayAlias,
   VERTEX_MODEL_ID_ENV,
 } from "../models.ts";
+import { BYOK_SLUG_MARKER } from "./apiKeys.ts";
 import { log } from "./cli.ts";
 import { VERTEX_SERVICE_ACCOUNT_JSON_ENV } from "./vertex.ts";
 
@@ -21,8 +25,22 @@ function hasEnvVar(name: string): boolean {
   return typeof val === "string" && val.length > 0;
 }
 
+/** every credential claude-code can run on, including `ANTHROPIC_AUTH_TOKEN` —
+ * the gateway variable it sends as `Authorization: Bearer`. opencode cannot use
+ * that one, so leaving it out routed a gateway-only run to the harness that had
+ * no way to authenticate it. */
 function hasClaudeCodeAuth(): boolean {
-  return hasEnvVar("CLAUDE_CODE_OAUTH_TOKEN") || hasEnvVar("ANTHROPIC_API_KEY");
+  return (
+    hasEnvVar("CLAUDE_CODE_OAUTH_TOKEN") ||
+    hasEnvVar("ANTHROPIC_API_KEY") ||
+    hasEnvVar("ANTHROPIC_AUTH_TOKEN")
+  );
+}
+
+/** either credential the codex CLI can run on: the ChatGPT-subscription blob
+ * `pullfrog auth codex` stores, or a plain OpenAI API key. */
+function hasCodexAuth(): boolean {
+  return hasEnvVar("CODEX_AUTH_JSON") || hasEnvVar("OPENAI_API_KEY");
 }
 
 function hasBedrockAuth(): boolean {
@@ -50,9 +68,9 @@ function resolveSlug(slug: string): string | undefined {
     const bedrockId = process.env[BEDROCK_MODEL_ID_ENV]?.trim();
     if (!bedrockId) {
       throw new Error(
-        `${BEDROCK_MODEL_ID_ENV} env var is required when the model is set to "${slug}". ` +
-          `set it to an AWS Bedrock model ID from the Bedrock console. ` +
-          `see https://docs.pullfrog.com/bedrock for setup.`
+        `\`${BEDROCK_MODEL_ID_ENV}\` ${BYOK_SLUG_MARKER} \`${slug}\`. ` +
+          "Set it in the workflow's `env:` block to a Bedrock model ID from the AWS console. " +
+          "[Amazon Bedrock setup guide](https://docs.pullfrog.com/bedrock)"
       );
     }
     return bedrockId;
@@ -61,9 +79,9 @@ function resolveSlug(slug: string): string | undefined {
     const vertexId = process.env[VERTEX_MODEL_ID_ENV]?.trim();
     if (!vertexId) {
       throw new Error(
-        `${VERTEX_MODEL_ID_ENV} env var is required when the model is set to "${slug}". ` +
-          `set it to a Google Vertex AI model ID from Model Garden. ` +
-          `see https://docs.pullfrog.com/vertex for setup.`
+        `\`${VERTEX_MODEL_ID_ENV}\` ${BYOK_SLUG_MARKER} \`${slug}\`. ` +
+          "Set it in the workflow's `env:` block to a Vertex AI model ID from Model Garden. " +
+          "[Google Vertex AI setup guide](https://docs.pullfrog.com/vertex)"
       );
     }
     return vertexId;
@@ -72,27 +90,57 @@ function resolveSlug(slug: string): string | undefined {
     const deployment = process.env[AZURE_DEPLOYMENT_ENV]?.trim();
     if (!deployment) {
       throw new Error(
-        `${AZURE_DEPLOYMENT_ENV} env var is required when the model is set to "${slug}". ` +
-          `set it to the name of your Azure OpenAI deployment (not the model it serves — ` +
-          `Azure routes on the deployment name). ` +
-          `see https://docs.pullfrog.com/azure for setup.`
+        `\`${AZURE_DEPLOYMENT_ENV}\` ${BYOK_SLUG_MARKER} \`${slug}\`. ` +
+          "Set it to your deployment's name, not the model it serves, on the Azure OpenAI provider in Pullfrog or in the workflow's `env:` block. " +
+          "[Azure OpenAI setup guide](https://docs.pullfrog.com/azure)"
       );
     }
     return `${AZURE_PROVIDER}/${deployment}`;
   }
-  if (alias?.routing === "openai-compatible") {
-    const modelId = process.env[OPENAI_COMPATIBLE_MODEL_ENV]?.trim();
+  const set = heldOpenAICompatibleSet(slug);
+  if (alias?.routing === "openai-compatible" || set) {
+    const modelEnv = openAICompatibleEnv(set).model;
+    const modelId = process.env[modelEnv]?.trim();
     if (!modelId) {
       throw new Error(
-        `${OPENAI_COMPATIBLE_MODEL_ENV} env var is required when the model is set to "${slug}". ` +
-          `set it to the model ID served by your OpenAI-compatible endpoint ` +
-          `(e.g. a Cloudflare AI Gateway or DashScope model). ` +
-          `see https://docs.pullfrog.com/openai-compatible for setup.`
+        `\`${modelEnv}\` ${BYOK_SLUG_MARKER} \`${slug}\`. ` +
+          "Set it to the model ID your endpoint serves, on the OpenAI-compatible provider in Pullfrog or in the workflow's `env:` block. " +
+          "[OpenAI-compatible setup guide](https://docs.pullfrog.com/openai-compatible)"
       );
     }
     return `${OPENAI_COMPATIBLE_PROVIDER}/${modelId}`;
   }
   return resolveCliModel(slug);
+}
+
+/**
+ * the named set `slug` picks, when this runner holds any of its values. holding none, the slug
+ * is a raw model id on the default endpoint, exactly as it was before sets existed.
+ */
+function heldOpenAICompatibleSet(slug: string): string | undefined {
+  const set = openAICompatibleSetName(slug);
+  return set && Object.values(openAICompatibleEnv(set)).some(hasEnvVar) ? set : undefined;
+}
+
+/**
+ * make the run's named set (`openai-compatible/<name>`) its endpoint: the set's five values
+ * replace the bare `OPENAI_COMPATIBLE_*` that validation and the opencode provider read. a value
+ * the set lacks is cleared, never inherited, so the default endpoint's key cannot reach the set's
+ * URL. returns the set, so setup errors can name its own variables.
+ */
+export function activateOpenAICompatibleSet(ctx: { slug: string | undefined }): string | undefined {
+  const slug = process.env.PULLFROG_MODEL?.trim() || ctx.slug?.trim();
+  const set = slug ? heldOpenAICompatibleSet(slug) : undefined;
+  if (!set) return undefined;
+  const from = openAICompatibleEnv(set);
+  const to = openAICompatibleEnv();
+  for (const field of OPENAI_COMPATIBLE_FIELDS) {
+    const value = process.env[from[field]];
+    if (value === undefined) delete process.env[to[field]];
+    else process.env[to[field]] = value;
+  }
+  log.info(`» using the OpenAI-compatible endpoint "${set}"`);
+  return set;
 }
 
 /**
@@ -135,8 +183,22 @@ export function resolveModel(ctx: { slug?: string | undefined }): string | undef
   return undefined;
 }
 
-export function resolveAgent(ctx: { model?: string | undefined }): Agent {
-  // 1. explicit env var override (escape hatch)
+export function resolveAgent(ctx: {
+  model?: string | undefined;
+  /** set on router / OSS runs, where the model is served by OpenRouter. those
+   * pin no `model`, so without this the auto-select branches below would read
+   * a stored Anthropic or OpenAI credential as the routing signal for a run
+   * that isn't using it. */
+  proxyModel?: string | undefined;
+  /** the account opted in to the EXPERIMENTAL codex harness, already ANDed
+   * server-side with the global kill switch. false — the default for every
+   * account — routes OpenAI models to opencode exactly as before the harness
+   * existed. see wiki/codex-agent.md. */
+  codexAgent?: boolean | undefined;
+}): Agent {
+  // 1. explicit env var override (escape hatch). deliberately NOT gated on the
+  //    opt-in: an operator who sets PULLFROG_AGENT in their own workflow is
+  //    asking for a specific harness, which is what the escape hatch is for.
   const envAgent = process.env.PULLFROG_AGENT?.trim();
   if (envAgent) {
     if (envAgent in agents) {
@@ -145,7 +207,10 @@ export function resolveAgent(ctx: { model?: string | undefined }): Agent {
     log.warning(`» unknown PULLFROG_AGENT="${envAgent}" — falling through to auto-select`);
   }
 
-  // 2. Bedrock routing: when BEDROCK_MODEL_ID is the resolved model, route
+  // 2. proxy runs are OpenRouter-served; only opencode speaks that provider.
+  if (ctx.proxyModel) return agents.opencode;
+
+  // 3. Bedrock routing: when BEDROCK_MODEL_ID is the resolved model, route
   //    Anthropic IDs through claude-code (which supports Bedrock natively
   //    once CLAUDE_CODE_USE_BEDROCK=1) and everything else through opencode's
   //    `amazon-bedrock` provider.
@@ -153,25 +218,42 @@ export function resolveAgent(ctx: { model?: string | undefined }): Agent {
     return isBedrockAnthropicId(ctx.model) ? agents.claude : agents.opencode;
   }
 
-  // 3. Vertex routing: same shape as Bedrock, but Anthropic Vertex IDs are
+  // 4. Vertex routing: same shape as Bedrock, but Anthropic Vertex IDs are
   //    anchored `claude-*` IDs and non-Anthropic models use opencode's
   //    `google-vertex` provider.
   if (ctx.model && hasVertexAuth() && process.env[VERTEX_MODEL_ID_ENV]?.trim() === ctx.model) {
     return isVertexAnthropicId(ctx.model) ? agents.claude : agents.opencode;
   }
 
-  // 4. if model is Anthropic and Claude Code credentials are available, use Claude Code
+  // 5. each vendor's own harness wins for its own models when the matching
+  //    credential is present — claude-code for Anthropic, codex for OpenAI.
   if (ctx.model) {
     try {
       const provider = getModelProvider(ctx.model);
-      if (provider === "anthropic" && hasClaudeCodeAuth()) {
-        return agents.claude;
-      }
+      if (provider === "anthropic" && hasClaudeCodeAuth()) return agents.claude;
+      if (provider === "openai" && ctx.codexAgent && hasCodexAuth()) return agents.codex;
     } catch {
       // invalid model format — fall through
     }
   }
 
-  // 5. default: OpenCode (universal, supports all providers)
+  // 6. auto-select with no configured model. an account whose only Anthropic
+  //    credential is one claude-code alone can present (the `ANTHROPIC_AUTH_TOKEN`
+  //    gateway variable, or a `CLAUDE_CODE_OAUTH_TOKEN` subscription) has to take
+  //    claude-code: opencode cannot use either, so `autoSelectModel` would rank a
+  //    catalog it has no way to authenticate and the run dies on a missing key.
+  //    the model is still unknown here — auto-select runs INSIDE the harness — so
+  //    this is the last point at which the credential can pick the harness that
+  //    matches it. a plain API key stays on opencode, whose ranking across
+  //    providers beats guessing from whichever env var we tested first — which is
+  //    also why a Codex/OpenAI credential yields to any Anthropic one.
+  if (!ctx.model) {
+    if (!hasEnvVar("ANTHROPIC_API_KEY") && CLAUDE_CODE_ONLY_CREDENTIALS.some(hasEnvVar)) {
+      return agents.claude;
+    }
+    if (ctx.codexAgent && hasCodexAuth() && !hasClaudeCodeAuth()) return agents.codex;
+  }
+
+  // 7. default: OpenCode (universal, supports all providers)
   return agents.opencode;
 }

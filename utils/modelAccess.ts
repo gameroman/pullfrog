@@ -22,7 +22,8 @@ import {
   ossFundedModelNames,
   resolveOpenRouterModel,
 } from "../models.ts";
-import { getApiUrl } from "./apiUrl.ts";
+import { pickModelLink, providerLink } from "./apiKeys.ts";
+import { renderFailure } from "./failureBody.ts";
 
 export type ModelAccessReason = "oss" | "byok_no_key" | "router";
 
@@ -111,27 +112,15 @@ export function buildModelAccessError(input: {
   owner: string;
   name: string;
 }): string {
-  const settingsUrl = `${getApiUrl()}/console/${input.owner}/${input.name}`;
-  const secretsUrl = `https://github.com/${input.owner}/${input.name}/settings/secrets/actions`;
-  const docsUrl = "https://docs.pullfrog.com/keys";
-
-  const headline = `**The ${MODEL_ACCESS_MARKER}: \`${input.model}\`.**`;
-
-  const branch: Record<ModelAccessReason, { why: string; cta: string }> = {
-    oss: {
-      why: `This repo runs on Pullfrog's OSS subsidy, which funds a set of pre-approved models: ${ossAllowedLabels()}. Pick one of those, or add your own provider key to run a different one.`,
-      cta: `[Configure model →](${settingsUrl}) · [Add a provider key →](${secretsUrl}) · [Setup docs →](${docsUrl})`,
-    },
-    byok_no_key: {
-      why: `No provider key for \`${input.model}\` is present in this run's environment. Add the matching provider key as a GitHub Actions secret, or pick a model you already have a key for.`,
-      cta: `[Open repo secrets →](${secretsUrl}) · [Configure model →](${settingsUrl}) · [Setup docs →](${docsUrl})`,
-    },
-    router: {
-      why: "Pullfrog Router can't serve this model. Pick a Router-supported model, or add your own provider key to run it directly.",
-      cta: `[Configure model →](${settingsUrl}) · [Add a provider key →](${secretsUrl})`,
-    },
+  const why: Record<ModelAccessReason, string> = {
+    oss: `This repo runs on Pullfrog's OSS subsidy, which funds a set of pre-approved models: ${ossAllowedLabels()}. Pick one of those, or connect your own provider to run a different one.`,
+    byok_no_key: `This run has no API key for \`${input.model}\`. Connect one, or pick a model you already have a key for.`,
+    router:
+      "Pullfrog Router can't serve this model. Pick a Router-supported model, or connect your own provider to run it directly.",
   };
-
-  const { why, cta } = branch[input.reason];
-  return [headline, "", why, "", cta].join("\n");
+  return renderFailure({
+    headline: `The ${MODEL_ACCESS_MARKER}: \`${input.model}\`.`,
+    detail: why[input.reason],
+    links: [pickModelLink(input), providerLink(input.owner)],
+  });
 }

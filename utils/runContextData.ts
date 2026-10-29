@@ -1,17 +1,23 @@
 import type { Octokit } from "@octokit/rest";
+import * as yes from "yes";
+import { installProviders, type RouterTier } from "../models.ts";
 import packageJson from "../package.json" with { type: "json" };
-import * as yes from "../yes/index.ts";
+import type { CommercialRefusal } from "./billingErrors.ts";
 import { log } from "./cli.ts";
 import { mintIdToken, type OctokitWithPlugins, parseRepoContext } from "./github.ts";
 import { isTransientOctokitError } from "./isTransientNetworkError.ts";
 import {
   type AccountPlan,
-  type CommercialRefusal,
   fetchRunContext,
+  type ModelRegistry,
   type RepoSettings,
 } from "./runContext.ts";
+import { maskSecret } from "./secretCommands.ts";
+import type { CredentialAccess } from "./subscriptionCredentials.ts";
+import { getHarnessPins } from "./version.ts";
 
 export interface RunContextData {
+  credentialAccess?: CredentialAccess | undefined;
   repo: {
     owner: string;
     name: string;
@@ -30,34 +36,46 @@ export interface RunContextData {
   /** the Router was declined because the wallet is empty. see
    * `RunContext.routerUnfunded`. */
   routerUnfunded?: boolean | undefined;
+  /** the account is inside its no-card trial and nothing else could fund this
+   * run, so the runner MAY mint a subsidized key on the efficient tier if its
+   * own key search comes up dry. a permission, not a routing decision — the
+   * server cannot see workflow `env:` keys. see `RunContext.trialFallback`. */
+  trialFallback?: boolean | undefined;
+  /** see `RunContext.trialCreditsLeftUsd`. */
+  trialCreditsLeftUsd?: number | undefined;
 }
 
 interface ResolveRunContextDataParams {
   octokit: OctokitWithPlugins;
   token: string;
+  /** the dispatch payload's run type, read before the payload is resolved
+   * because run-context is fetched first and needs it to pick this trigger's
+   * model override. */
+  runType?: string | undefined;
+  /** the prompt is plain text, never a Pullfrog dispatch payload. */
+  plainPrompt: boolean;
+  /** the model router's tier from the payload, forwarded so run-context applies it to the proxy mint. */
+  routedTier?: RouterTier | undefined;
 }
 
 /**
- * true when the action is pinned to a full commit SHA (vs the moving `@v0`
- * tag or a branch). GitHub runs the action's `post:` hook (and reads
- * `action.yml`) straight from the checked-out action ref, so a SHA pin freezes
- * that checkout forever: the main agent still floats to the latest `^semver`
- * via the npm bootstrap (this code is proof — it ran), but the post-run
- * cleanup step keeps executing the pinned commit's source and never receives
- * fixes. surfaced in the log and PR footers to nudge repos back to `@v0`.
+ * Swaps in the deployed server's alias registry, so a merged `action/models.ts` change reaches this
+ * run without waiting for a release. A registry written against other harness pins waits for the
+ * release that carries them: a model bump that needs a newer CLI would otherwise reach this one.
  */
-export function isActionPinnedToSha(): boolean {
-  const ref = process.env.GITHUB_ACTION_REF;
-  return !!ref && /^[0-9a-f]{40}$/i.test(ref);
-}
-
-function warnIfPinnedToSha(): void {
-  if (isActionPinnedToSha()) {
+function installServedRegistry(served: ModelRegistry): void {
+  const pins = getHarnessPins();
+  const moved = Object.keys(pins).filter((name) => served.harnessPins[name] !== pins[name]);
+  if (moved.length > 0) {
+    const theirs = moved.map((name) => `${name}@${served.harnessPins[name]}`).join(", ");
+    log.info(`» kept the bundled model registry: the server's is written for ${theirs}`);
+    return;
+  }
+  try {
+    installProviders(served.providers);
+  } catch (error) {
     log.warning(
-      `» pinned to a commit SHA (${process.env.GITHUB_ACTION_REF}); the post-run cleanup step is ` +
-        "frozen at that commit and won't receive fixes. keep the SHA fresh with Dependabot, or " +
-        "pin to `pullfrog/pullfrog@v0` if your org doesn't require full-SHA action pinning — " +
-        "see https://docs.pullfrog.com/versioning"
+      `» kept the bundled model registry: the server's ${error instanceof Error ? error.message : error}`
     );
   }
 }
@@ -76,7 +94,6 @@ export async function resolveRunContextData(
   log.info(
     `» running Pullfrog v${packageJson.version}${actionRef ? ` (ref: ${actionRef})` : ""}...`
   );
-  warnIfPinnedToSha();
 
   const repoContext = parseRepoContext();
 
@@ -87,9 +104,10 @@ export async function resolveRunContextData(
   // attempt, no retry.
   let oidcToken: string | undefined;
   try {
-    oidcToken = await yes.op(() => mintIdToken(), {
+    oidcToken = await yes.query({
+      run: () => mintIdToken(),
       name: "OIDC mint",
-      retries: process.env.ACTIONS_ID_TOKEN_REQUEST_URL ? [200, 1000] : [],
+      retry: process.env.ACTIONS_ID_TOKEN_REQUEST_URL ? [200, 1000] : [],
     })();
   } catch {
     // OIDC not available (local dev, non-actions environment, fork PRs)
@@ -101,14 +119,24 @@ export async function resolveRunContextData(
   // sibling fetchRunContext degrades to defaults). retry the transient blip.
   // see #999.
   const [repoResponse, runContext] = await Promise.all([
-    yes.op(() => params.octokit.repos.get({ owner: repoContext.owner, repo: repoContext.name }), {
+    yes.query({
+      run: () => params.octokit.repos.get({ owner: repoContext.owner, repo: repoContext.name }),
       name: "repos.get",
-      retries: [100, 500],
-      bail: (error) => !isTransientOctokitError(error),
+      retry: (error, attempt) =>
+        isTransientOctokitError(error) ? yes.backoff([100, 500], attempt) : -1,
     })(),
-    fetchRunContext({ token: params.token, repoContext, oidcToken }),
+    fetchRunContext({
+      token: params.token,
+      repoContext,
+      oidcToken,
+      runType: params.runType,
+      plainPrompt: params.plainPrompt,
+      routedTier: params.routedTier,
+    }),
   ]);
 
+  if (runContext.apiToken) maskSecret(runContext.apiToken);
+  if (runContext.modelRegistry) installServedRegistry(runContext.modelRegistry);
   return {
     repo: {
       owner: repoContext.owner,
@@ -121,6 +149,7 @@ export async function resolveRunContextData(
     plan: runContext.plan,
     proxyModel: runContext.proxyModel,
     dbSecrets: runContext.dbSecrets,
+    credentialAccess: runContext.credentialAccess,
     commercialRefused: runContext.commercialRefused,
     // a failed mint on a runner that should have been able to mint is the same
     // outcome as the server-side failure: the run never sees stored secrets.
@@ -128,5 +157,7 @@ export async function resolveRunContextData(
       runContext.secretsUnavailable ||
       (!!process.env.ACTIONS_ID_TOKEN_REQUEST_URL && oidcToken === undefined),
     routerUnfunded: runContext.routerUnfunded,
+    trialFallback: runContext.trialFallback,
+    trialCreditsLeftUsd: runContext.trialCreditsLeftUsd,
   };
 }

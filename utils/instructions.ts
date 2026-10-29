@@ -128,13 +128,10 @@ function getShellInstructions(
 
 Shell command execution is DISABLED. Do not attempt to run shell commands.`;
     case "restricted":
-      return `### Shell commands
-
-Use the \`${t("shell")}\` MCP tool for all shell command execution. This tool provides a secure environment with filtered credentials. Do NOT use any native shell tool — it is disabled for security. For long-running processes (dev servers, watchers), use \`shell({ command, background: true })\`. Use \`${t("kill_background")}\` to stop background processes.`;
     case "enabled":
       return `### Shell commands
 
-Use your native shell tool for shell command execution.`;
+Use the \`${t("shell")}\` MCP tool for all shell command execution.${shell === "restricted" ? " This tool provides a secure environment with filtered credentials. Do NOT use any native shell tool — it is disabled for security." : ""} For long-running processes (dev servers, watchers), use \`shell({ command, background: true })\`. Use \`${t("kill_background")}\` to stop background processes.`;
     default: {
       const _exhaustive: never = shell;
       return _exhaustive satisfies never;
@@ -372,6 +369,7 @@ Rules:
 
 Use MCP tools from ${pullfrogMcpName} for all GitHub operations. Never use the \`gh\` CLI — it is not authenticated and will fail. The MCP tools handle authentication and enforce permissions.
 ${
+  ctx.payload.event.issue_number !== undefined &&
   hasSimilarIssues({ repoIntelligence: ctx.repoIntelligence, event: ctx.payload.event })
     ? `
 #### Duplicate detection (enabled for this repository)

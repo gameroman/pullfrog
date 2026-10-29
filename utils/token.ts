@@ -4,8 +4,8 @@ import type { AuthorPermission, PushPermission, XrepoConfig } from "../external.
 import { log } from "./cli.ts";
 import { onExitSignal } from "./exitHandler.ts";
 import { acquireNewToken, type OidcCredentials } from "./github.ts";
-import { isGitHubActions } from "./globals.ts";
 import { formatPermissions, mirrorRolePermissions } from "./roleMirror.ts";
+import { maskSecret } from "./secretCommands.ts";
 
 // re-export for `pullfrog gha token` subcommand
 export { acquireNewToken as acquireInstallationToken };
@@ -84,6 +84,12 @@ type ResolveTokensParams = {
   // READ set. absent → single-repo, primary-scoped tokens (unchanged).
   xrepo?: XrepoConfig | undefined;
   /**
+   * handle to the cross-repo grant the server persisted for this run. required
+   * alongside `xrepo`: the mint endpoint refuses a `repos` list without one,
+   * because the runner's list is attacker-controlled on a manual dispatch.
+   */
+  xrepoGrant?: string | undefined;
+  /**
    * OIDC credentials stashed by main.ts before the restricted-mode env wipe —
    * the mid-run MCP token refresh mints from this snapshot (#891). null when
    * OIDC isn't available (local dev, external token).
@@ -116,9 +122,7 @@ export async function resolveTokens(params: ResolveTokensParams): Promise<TokenR
   if (externalToken) {
     mcpTokenValue = externalToken;
 
-    if (isGitHubActions) {
-      core.setSecret(externalToken);
-    }
+    maskSecret(externalToken);
 
     log.info("» using external GH_TOKEN for both git and MCP");
 
@@ -150,10 +154,12 @@ export async function resolveTokens(params: ResolveTokensParams): Promise<TokenR
     params.push === "disabled"
       ? { contents: "read" as const }
       : { contents: "write" as const, workflows: "write" as const };
-  const gitToken = await acquireNewToken({ repos: writeRepos, permissions: gitPermissions });
-  if (isGitHubActions) {
-    core.setSecret(gitToken);
-  }
+  const gitToken = await acquireNewToken({
+    repos: writeRepos,
+    xrepoGrant: params.xrepoGrant,
+    permissions: gitPermissions,
+  });
+  maskSecret(gitToken);
   log.info(
     `» acquired git token (${Object.entries(gitPermissions)
       .map((e) => e.join(":"))
@@ -171,12 +177,16 @@ export async function resolveTokens(params: ResolveTokensParams): Promise<TokenR
     // commit-status check-runs for branch protection. the app already grants
     // checks:write; this scopes the MCP token up to use it.
     checks: "write",
-    actions: "read",
+    // write (not read) so postReviewCleanup can dispatch the follow-up re-review
+    // for commits pushed while a review was in flight; read 403s it.
+    actions: "write",
   } as const;
-  const mcpToken = await acquireNewToken({ repos: writeRepos, permissions: mcpPermissions });
-  if (isGitHubActions) {
-    core.setSecret(mcpToken);
-  }
+  const mcpToken = await acquireNewToken({
+    repos: writeRepos,
+    xrepoGrant: params.xrepoGrant,
+    permissions: mcpPermissions,
+  });
+  maskSecret(mcpToken);
   log.info(
     `» acquired scoped MCP token (${Object.entries(mcpPermissions)
       .map((e) => e.join(":"))
@@ -186,14 +196,16 @@ export async function resolveTokens(params: ResolveTokensParams): Promise<TokenR
   // credential for the `gh` MCP tool, mirroring the triggering user's own role.
   // deliberately a SEPARATE token from mcpToken: the MCP token stays
   // broad-and-unreachable, while this one is handed to a subprocess that can
-  // print it, so its scope is the entire security boundary. primary repo only —
-  // `repos: undefined` scopes it to the repo the run was dispatched for, so a
-  // leak cannot reach the cross-repo write set.
+  // print it, so its scope is the entire security boundary. passing NO `repos`
+  // does not mean unscoped: `acquireTokenViaOIDC` always appends
+  // `$GITHUB_REPOSITORY`, so the list is exactly `[this repo]` regardless of how
+  // much org-wide reach the triggerer has, and a leak cannot cross into the
+  // xrepo write set. see mirrorRolePermissions for why that stays correct.
   const ghPermissions = mirrorRolePermissions(params.authorPermission);
   let ghToken: string | undefined;
   if (ghPermissions) {
     ghToken = await acquireNewToken({ permissions: ghPermissions });
-    if (isGitHubActions) core.setSecret(ghToken);
+    maskSecret(ghToken);
     log.info(
       `» acquired gh token mirroring ${params.authorPermission} (${formatPermissions(ghPermissions)})`
     );
@@ -204,9 +216,10 @@ export async function resolveTokens(params: ResolveTokensParams): Promise<TokenR
   if (params.xrepo) {
     readToken = await acquireNewToken({
       repos: params.xrepo.read,
+      xrepoGrant: params.xrepoGrant,
       permissions: { contents: "read" },
     });
-    if (isGitHubActions) core.setSecret(readToken);
+    maskSecret(readToken);
     log.info(`» acquired cross-repo read token (contents:read, ${params.xrepo.read.length} repos)`);
   }
 
@@ -231,13 +244,12 @@ export async function resolveTokens(params: ResolveTokensParams): Promise<TokenR
     // the primary only (secondaries would start 403ing mid-run).
     refreshPromise ??= acquireNewToken({
       repos: writeRepos,
+      xrepoGrant: params.xrepoGrant,
       permissions: mcpPermissions,
       oidc: params.oidc ?? undefined,
     })
       .then((fresh) => {
-        if (isGitHubActions) {
-          core.setSecret(fresh);
-        }
+        maskSecret(fresh);
         mcpTokenValue = fresh;
         currentMcpToken = fresh;
         log.warning("» GitHub rejected the MCP token; re-acquired a fresh scoped MCP token");
@@ -262,11 +274,12 @@ export async function resolveTokens(params: ResolveTokensParams): Promise<TokenR
     if (stale === currentGitToken) {
       gitRefreshPromise ??= acquireNewToken({
         repos: writeRepos,
+        xrepoGrant: params.xrepoGrant,
         permissions: gitPermissions,
         oidc: params.oidc ?? undefined,
       })
         .then((fresh) => {
-          if (isGitHubActions) core.setSecret(fresh);
+          maskSecret(fresh);
           void revokeGitHubInstallationToken(currentGitToken);
           currentGitToken = fresh;
           log.warning("» GitHub rejected the git token; re-acquired a fresh git token");
@@ -281,11 +294,12 @@ export async function resolveTokens(params: ResolveTokensParams): Promise<TokenR
       const read = currentReadToken;
       readRefreshPromise ??= acquireNewToken({
         repos: params.xrepo?.read,
+        xrepoGrant: params.xrepoGrant,
         permissions: { contents: "read" },
         oidc: params.oidc ?? undefined,
       })
         .then((fresh) => {
-          if (isGitHubActions) core.setSecret(fresh);
+          maskSecret(fresh);
           void revokeGitHubInstallationToken(read);
           currentReadToken = fresh;
           log.warning("» GitHub rejected the read token; re-acquired a fresh read token");

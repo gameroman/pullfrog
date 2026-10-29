@@ -5,6 +5,8 @@ type ComputeIncrementalDiffParams = {
   baseBranch: string;
   beforeSha: string;
   headSha: string;
+  /** tips the base branch was force-pushed away from, which either version may still be built on */
+  formerBaseTips: string[];
 };
 
 /**
@@ -52,19 +54,25 @@ export function computeIncrementalDiff(
   params: ComputeIncrementalDiffParams
 ): IncrementalDiffResult {
   try {
-    // $1=beforeSha, $2=baseBranch, $3=headSha
+    const tips = [`origin/${params.baseBranch}`, ...params.formerBaseTips];
+    const oldBase = versionBase({ sha: params.beforeSha, tips });
+    const newBase = versionBase({ sha: params.headSha, tips });
+    const replayed =
+      oldBase === newBase ? null : replay({ sha: params.beforeSha, from: oldBase, onto: newBase });
+    // $1/$2=the old version's base and tree (newBase and the replayed tree once replayed),
+    // $3=newBase, $4=headSha. one commit per side, so a creation factor this high always pairs
+    // them; the default 60 calls a reworked delta a rewrite and prints no patch
     const raw = $(
       "sh",
       [
         "-c",
-        'old_base=$(git merge-base "$1" "origin/$2") && ' +
-          'new_base=$(git merge-base "$3" "origin/$2") && ' +
-          "git range-diff --no-color " +
-          '"$old_base..$(git commit-tree "$1^{tree}" -p "$old_base" -m x)" ' +
-          '"$new_base..$(git commit-tree "$3^{tree}" -p "$new_base" -m x)"',
+        "git range-diff --no-color --creation-factor=1000 " +
+          '"$1..$(git commit-tree "$2^{tree}" -p "$1" -m x)" ' +
+          '"$3..$(git commit-tree "$4^{tree}" -p "$3" -m x)"',
         "--",
-        params.beforeSha,
-        params.baseBranch,
+        replayed ? newBase : oldBase,
+        replayed ?? params.beforeSha,
+        newBase,
         params.headSha,
       ],
       { log: false }
@@ -79,6 +87,57 @@ export function computeIncrementalDiff(
     // lost their incremental diff completely silently. see #1139.
     log.warning(`» incremental diff unavailable: range-diff failed: ${reason}`);
     return { status: "unavailable", reason };
+  }
+}
+
+function git(args: string[]): string {
+  return $("git", args, { log: false }).trim();
+}
+
+/**
+ * the base a version was built on. after the base branch is force-pushed (a restacked stacked PR)
+ * a version still on the old branch has its merge base with `origin/<base>` fall back to the fork
+ * point, dragging the whole old base branch into the delta, so the candidate leaving the fewest
+ * commits under `sha` wins. a former tip that was never fetched has no merge base and drops out.
+ */
+function versionBase(params: { sha: string; tips: string[] }): string {
+  let best: { tip: string; sha: string; commits: number } | undefined;
+  for (const tip of params.tips) {
+    let sha: string;
+    try {
+      sha = git(["merge-base", params.sha, tip]);
+    } catch {
+      continue;
+    }
+    const commits = Number(git(["rev-list", "--count", `${sha}..${params.sha}`]));
+    if (!best || commits < best.commits) best = { tip, sha, commits };
+  }
+  if (!best) throw new Error(`no merge base between ${params.sha} and the base branch`);
+  if (best.tip !== params.tips[0]) {
+    log.info(`» incremental diff: ${params.sha.slice(0, 7)} sits on former base tip ${best.tip}`);
+  }
+  return best.sha;
+}
+
+/**
+ * the old version's tree replayed onto the new base, so whatever the new base already carries drops
+ * out: a parent PR squash-merged into it (no merge base reaches those commits), or main's own changes
+ * near the PR's lines. null when the replay conflicts, and each version is compared on its own base.
+ */
+function replay(params: { sha: string; from: string; onto: string }): string | null {
+  try {
+    return git([
+      "merge-tree",
+      "--write-tree",
+      `--merge-base=${params.from}`,
+      params.onto,
+      params.sha,
+    ]);
+  } catch {
+    log.info(
+      `» incremental diff: ${params.sha.slice(0, 7)} does not replay onto the new base; comparing each on its own`
+    );
+    return null;
   }
 }
 
@@ -98,7 +157,9 @@ function isDiffPrefix(ch: string): boolean {
  *
  * uses a streaming approach: a ring buffer of before-context lines is flushed when
  * a change is hit, then afterCount lines of after-context are emitted directly.
- * nearest preceding ## / @@ headers are force-included when outside the context window.
+ * nearest preceding ## / @@ headers are force-included when outside the context window,
+ * and so is the outer `@@ <file>[: <function>]` hunk header, which is often the only
+ * line naming the file a change belongs to.
  */
 export function postProcessRangeDiff(raw: string, contextLines = 3): string | null {
   if (!raw.trim()) return null;
@@ -107,6 +168,8 @@ export function postProcessRangeDiff(raw: string, contextLines = 3): string | nu
   type Line = { prefix: string; from: number; to: number; seq: number };
 
   const beforeBuf: Line[] = [];
+  let lastOuterHdr: Line | null = null;
+  let outerHdrEmitted = true;
   let lastFileHdr: Line | null = null;
   let lastHunkHdr: Line | null = null;
   let fileHdrEmitted = true;
@@ -122,17 +185,36 @@ export function postProcessRangeDiff(raw: string, contextLines = 3): string | nu
     if (lastEmittedSeq >= 0 && line.seq > lastEmittedSeq + 1) out += (out ? "\n" : "") + "...";
     out += (out ? "\n" : "") + line.prefix + raw.slice(line.from, line.to);
     lastEmittedSeq = line.seq;
+    if (lastOuterHdr?.seq === line.seq) outerHdrEmitted = true;
     if (lastFileHdr?.seq === line.seq) fileHdrEmitted = true;
     if (lastHunkHdr?.seq === line.seq) hunkHdrEmitted = true;
   }
 
   function flushBefore() {
-    if (lastFileHdr && !fileHdrEmitted) emit(lastFileHdr);
-    if (lastHunkHdr && !hunkHdrEmitted) emit(lastHunkHdr);
-    for (const line of beforeBuf) {
-      if (line.seq > lastEmittedSeq) emit(line);
+    const headers = [
+      outerHdrEmitted ? null : lastOuterHdr,
+      fileHdrEmitted ? null : lastFileHdr,
+      hunkHdrEmitted ? null : lastHunkHdr,
+    ].filter((line): line is Line => line !== null);
+    // in line order, so emitting a header never skips the context above it
+    const pending = [...headers, ...beforeBuf.filter((line) => line.seq > lastEmittedSeq)].sort(
+      (a, b) => a.seq - b.seq
+    );
+    for (const [i, line] of pending.entries()) {
+      if (pending[i - 1]?.seq !== line.seq) emit(line);
     }
     beforeBuf.length = 0;
+  }
+
+  function isFileHeader(pos: number): boolean {
+    return raw.startsWith("## ", pos) && !raw.startsWith("## Commit message", pos);
+  }
+
+  function markFileHeader(line: Line, emitted: boolean) {
+    lastFileHdr = line;
+    fileHdrEmitted = emitted;
+    lastHunkHdr = null;
+    hunkHdrEmitted = true;
   }
 
   let cursor = 0;
@@ -145,7 +227,23 @@ export function postProcessRangeDiff(raw: string, contextLines = 3): string | nu
       continue;
     }
 
-    if (lineEnd - cursor >= 5 && raw.startsWith("    ", cursor)) {
+    if (raw.startsWith("    @@", cursor)) {
+      // range-diff labels an outer hunk with its nearest section, which names no file when
+      // that section is its own metadata or commit message
+      const label = raw.slice(cursor + 4, lineEnd);
+      lastOuterHdr =
+        label === "@@ Metadata" || label === "@@ Commit message"
+          ? null
+          : { prefix: "", from: cursor + 4, to: lineEnd, seq };
+      outerHdrEmitted = false;
+      lastFileHdr = null;
+      fileHdrEmitted = true;
+      lastHunkHdr = null;
+      hunkHdrEmitted = true;
+      beforeBuf.length = 0;
+      afterRemaining = 0;
+      seq++;
+    } else if (lineEnd - cursor >= 5 && raw.startsWith("    ", cursor)) {
       const prefix = raw[cursor + 4];
       if (isDiffPrefix(prefix)) {
         const contentPos = cursor + 5;
@@ -158,16 +256,14 @@ export function postProcessRangeDiff(raw: string, contextLines = 3): string | nu
         } else if (isDiffPrefix(raw[contentPos])) {
           isChange = isOuterChange;
           line = { prefix, from: contentPos + 1, to: lineEnd, seq };
+          // git prints a file header as inner context, `     ## <file> ##`
+          if (raw[contentPos] === " " && isFileHeader(contentPos + 1)) {
+            markFileHeader(line, isChange);
+          }
         } else {
           line = { prefix, from: contentPos, to: lineEnd, seq };
-          if (
-            raw.startsWith("## ", contentPos) &&
-            !raw.startsWith("## Commit message", contentPos)
-          ) {
-            lastFileHdr = line;
-            fileHdrEmitted = false;
-            lastHunkHdr = null;
-            hunkHdrEmitted = true;
+          if (isFileHeader(contentPos)) {
+            markFileHeader(line, false);
           } else if (
             raw.startsWith("@@", contentPos) &&
             !raw.startsWith("@@ Metadata", contentPos)

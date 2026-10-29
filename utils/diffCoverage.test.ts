@@ -13,13 +13,14 @@ const toc = `## Files (2)
 
 ---
 `;
+const tocEntries = parseDiffTocEntries({ toc });
 
 describe("diff coverage line checker", () => {
   it("treats Read offsets as zero based", () => {
     const state = createDiffCoverageState({
       diffPath,
       totalLines: 30,
-      toc,
+      tocEntries,
     });
 
     const tracked = recordDiffReadFromToolUse({
@@ -42,7 +43,7 @@ describe("diff coverage line checker", () => {
     const state = createDiffCoverageState({
       diffPath,
       totalLines: 30,
-      toc,
+      tocEntries,
     });
 
     const tracked = recordDiffReadFromToolUse({
@@ -65,7 +66,7 @@ describe("diff coverage line checker", () => {
     const state = createDiffCoverageState({
       diffPath,
       totalLines: 30,
-      toc,
+      tocEntries,
     });
 
     const tracked = recordDiffReadFromToolUse({
@@ -99,11 +100,11 @@ describe("diff coverage line checker", () => {
   });
 
   it("carries forward coveragePreflightRan from a previous state across checkout refreshes", () => {
-    const previous = createDiffCoverageState({ diffPath, totalLines: 30, toc });
+    const previous = createDiffCoverageState({ diffPath, totalLines: 30, tocEntries });
     previous.coveragePreflightRan = true;
     previous.coveredRanges = [{ startLine: 5, endLine: 10 }];
 
-    const next = createDiffCoverageState({ diffPath, totalLines: 50, toc, previous });
+    const next = createDiffCoverageState({ diffPath, totalLines: 50, tocEntries, previous });
 
     expect(next.coveragePreflightRan).toBe(true);
     // coveredRanges are tied to the previous diff content and must not leak forward
@@ -112,7 +113,7 @@ describe("diff coverage line checker", () => {
   });
 
   it("defaults coveragePreflightRan to false when no previous state is provided", () => {
-    const state = createDiffCoverageState({ diffPath, totalLines: 30, toc });
+    const state = createDiffCoverageState({ diffPath, totalLines: 30, tocEntries });
     expect(state.coveragePreflightRan).toBe(false);
   });
 
@@ -120,7 +121,7 @@ describe("diff coverage line checker", () => {
     const state = createDiffCoverageState({
       diffPath,
       totalLines: 30,
-      toc,
+      tocEntries,
     });
 
     recordDiffReadFromToolUse({

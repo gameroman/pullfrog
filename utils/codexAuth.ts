@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { type CodexAuthBody, refreshCodexAuthBody, stringifyCodexAuthBody } from "./codexOAuth.ts";
 
 /**
@@ -21,7 +21,7 @@ export type CodexAuthJson = CodexAuthBody;
 
 /** force one refresh round-trip against the OAuth provider so the saved
  * credential carries the freshest refresh token. used right after `codex
- * login --device-auth` and again any time we want to bump the chain before
+ * login` and again any time we want to bump the chain before
  * persisting (avoids the user's laptop refreshing first and burning ours).
  * Server-side rotation at run-context uses `refreshCodexAuthBody` directly. */
 export async function refreshCodexAuth(auth: CodexAuth): Promise<CodexAuth> {
@@ -36,6 +36,9 @@ export type ProgressEvent =
   | { kind: "cancel" };
 
 interface RunOptions {
+  /** sign in with a one-time code instead of Codex's browser redirect to
+   * localhost — the only login that works when the browser is on another machine. */
+  deviceAuth: boolean;
   /** abort the whole flow when true is returned. polled before each retry. */
   shouldRetry: () => Promise<boolean>;
   /** observe progress for UI rendering. */
@@ -53,27 +56,27 @@ interface RunOptions {
    * escapes Codex emitted); the caller is responsible for stripping/styling.
    */
   onChildLine?: (line: string, stream: "stdout" | "stderr") => void;
-  /** how long a single device-auth attempt is allowed to run. */
+  /** how long a single login attempt is allowed to run. */
   perAttemptTimeoutMs?: number;
 }
 
 /**
- * mint a fresh Codex subscription credential by running `codex login
- * --device-auth` against an isolated `CODEX_HOME`. the user's global
+ * mint a fresh Codex subscription credential by running `codex login`
+ * against an isolated `CODEX_HOME`. the user's global
  * `~/.codex/auth.json` is never touched; on success or failure, the
  * temporary home is cleaned up.
  *
- * the caller controls retry behavior via `shouldRetry`: when device auth
- * exits without writing `auth.json` (most commonly because the user needed
- * to enable device-code auth on their ChatGPT account first), the function
- * invokes `shouldRetry()` to decide whether to spin up another attempt.
+ * the caller controls retry behavior via `shouldRetry`: when the login
+ * exits without writing `auth.json` (under `deviceAuth`, most commonly because
+ * the user needed to enable device-code auth on their ChatGPT account first),
+ * the function invokes `shouldRetry()` to decide whether to spin up another attempt.
  */
 export async function mintCodexAuth(options: RunOptions): Promise<CodexAuth> {
   // mkdtempSync already creates the dir with the default 0o700 perms on
   // posix; an extra mkdirSync would just be ceremony.
   const codexHome = mkdtempSync(join(tmpdir(), "pullfrog-codex-"));
   try {
-    // device auth requires file-backed credentials; otherwise Codex routes the
+    // the login needs file-backed credentials; otherwise Codex routes the
     // refresh token into the OS keyring and we can't observe / persist it.
     writeFileSync(join(codexHome, "config.toml"), 'cli_auth_credentials_store = "file"\n', {
       mode: 0o600,
@@ -84,8 +87,9 @@ export async function mintCodexAuth(options: RunOptions): Promise<CodexAuth> {
 
     while (true) {
       options.onProgress?.({ kind: "start", attempt });
-      const result = await runDeviceAuth({
+      const result = await runCodexLogin({
         codexHome,
+        deviceAuth: options.deviceAuth,
         timeoutMs: options.perAttemptTimeoutMs ?? 15 * 60 * 1000,
         childStdio: options.childStdio ?? "inherit",
         onChildLine: options.onChildLine,
@@ -112,17 +116,18 @@ export async function mintCodexAuth(options: RunOptions): Promise<CodexAuth> {
   }
 }
 
-interface DeviceAuthResult {
+interface CodexLoginResult {
   exitCode: number;
   signal: NodeJS.Signals | null;
   /** true if the attempt was killed by our per-attempt timeout (vs. exited
    * naturally or was interrupted by the user). lets callers distinguish
-   * "user walked away" from "user closed the device flow early". */
+   * "user walked away" from "user closed the login early". */
   timedOut: boolean;
 }
 
-interface DeviceAuthInput {
+interface CodexLoginInput {
   codexHome: string;
+  deviceAuth: boolean;
   timeoutMs: number;
   childStdio: "inherit" | "pipe";
   onChildLine?: ((line: string, stream: "stdout" | "stderr") => void) | undefined;
@@ -133,17 +138,122 @@ interface DeviceAuthInput {
  * don't want the CLI pinned forever. */
 const SIGTERM_GRACE_MS = 5_000;
 
-/** spawn `codex login --device-auth` with stdin closed so Codex doesn't hang
+/** what Windows falls back to when `PATHEXT` is unset. */
+const DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD";
+
+/** Windows environment variables are case-insensitive and it spells them `Path`
+ * and `ComSpec`. `process.env` honours that; a plain object — a spread copy, or
+ * an env a caller built — does not, and silently reads back undefined. */
+function envValue(env: NodeJS.ProcessEnv, name: string): string | undefined {
+  if (env[name] !== undefined) return env[name];
+  const key = Object.keys(env).find((candidate) => candidate.toUpperCase() === name.toUpperCase());
+  return key === undefined ? undefined : env[key];
+}
+
+/** the command processor, by absolute path. a bare `cmd.exe` would lean on the
+ * very PATH resolution this module exists to stop relying on, and `spawn` finds
+ * nothing when `PATH` is narrowed. */
+function commandProcessor(env: NodeJS.ProcessEnv): string {
+  return (
+    envValue(env, "ComSpec") ??
+    join(envValue(env, "SystemRoot") ?? "C:\\Windows", "system32", "cmd.exe")
+  );
+}
+
+/** a resolved command, ready to hand to `spawn`. */
+interface SpawnTarget {
+  file: string;
+  args: string[];
+  /** the real process sits behind a `cmd.exe` wrapper, so a signal aimed at
+   * the child reaches only the wrapper. */
+  wrapped: boolean;
+}
+
+/**
+ * resolve a bare command the way a Windows *shell* would, which is not how
+ * `spawn` does it. Node's PATH search is libuv's `path_search_walk_ext`: it
+ * tries the name, then `.com`, then `.exe`, and never reads `PATHEXT`.
+ * `@openai/codex` installs as a `codex.cmd` shim, so `spawn("codex")` is ENOENT
+ * on a machine where `codex --version` works in every shell.
+ *
+ * POSIX resolves bare names correctly already and keeps the plain spawn.
+ */
+export function resolveSpawnTarget(params: {
+  command: string;
+  args: string[];
+  env: NodeJS.ProcessEnv;
+}): SpawnTarget | null {
+  if (process.platform !== "win32") {
+    return { file: params.command, args: params.args, wrapped: false };
+  }
+
+  const extensions = (envValue(params.env, "PATHEXT") ?? DEFAULT_PATHEXT)
+    .split(";")
+    .filter(Boolean);
+  for (const directory of (envValue(params.env, "PATH") ?? "").split(delimiter).filter(Boolean)) {
+    for (const extension of extensions) {
+      const candidate = join(directory, `${params.command}${extension.toLowerCase()}`);
+      // `existsSync` swallows EACCES on a PATH entry we can't read, which is
+      // what we want: keep walking, exactly as libuv's own search does.
+      if (!existsSync(candidate)) continue;
+      if (!/\.(cmd|bat)$/i.test(candidate)) {
+        return { file: candidate, args: params.args, wrapped: false };
+      }
+      // Node refuses to spawn a .bat/.cmd directly since CVE-2024-27980, so a
+      // shim must go through the command processor. the OUTER quote pair is
+      // what `/s` strips, leaving the inner quoted path intact — without it a
+      // path containing a space runs nothing at all, which is the common case
+      // under `C:\Users\First Last`. same shape Node's own `shell: true` emits.
+      // every argument here is a compile-time constant, so there is nothing to
+      // escape beyond that.
+      const command = [`"${candidate}"`, ...params.args].join(" ");
+      return {
+        file: commandProcessor(params.env),
+        args: ["/d", "/s", "/c", `"${command}"`],
+        wrapped: true,
+      };
+    }
+  }
+  return null;
+}
+
+/** on Windows a shell finding `codex` proves nothing about `spawn`, so name the
+ * extensions actually searched rather than telling a user whose PATH is already
+ * correct to reinstall. */
+function codexNotFoundMessage(env: NodeJS.ProcessEnv): string {
+  const install =
+    "install it with `npm i -g @openai/codex` or see https://developers.openai.com/codex/cli for other install options.";
+  if (process.platform !== "win32") return `codex CLI not found on PATH. ${install}`;
+  const extensions = (envValue(env, "PATHEXT") ?? DEFAULT_PATHEXT)
+    .split(";")
+    .filter(Boolean)
+    .join(" ");
+  return `codex CLI not found on PATH (searched every PATH entry for codex with ${extensions}). a working \`codex --version\` in a shell does not prove Node can spawn it. ${install}`;
+}
+
+/** spawn `codex login` with stdin closed so Codex doesn't hang
  * waiting for input. by default inherits stdout/stderr so the user sees the
- * device URL + one-time code Codex prints; when `pipe`d, lines are forwarded
+ * sign-in URL (and, under `deviceAuth`, the one-time code) Codex prints; when `pipe`d, lines are forwarded
  * to `onChildLine` so the caller can re-style them. on per-attempt timeout,
  * sends SIGTERM and escalates to SIGKILL after a short grace.
  */
-function runDeviceAuth(input: DeviceAuthInput): Promise<DeviceAuthResult> {
+function runCodexLogin(input: CodexLoginInput): Promise<CodexLoginResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn("codex", ["login", "--device-auth"], {
+    const target = resolveSpawnTarget({
+      command: "codex",
+      args: input.deviceAuth ? ["login", "--device-auth"] : ["login"],
+      env: process.env,
+    });
+    if (!target) {
+      reject(new Error(codexNotFoundMessage(process.env)));
+      return;
+    }
+
+    const child = spawn(target.file, target.args, {
       env: { ...process.env, CODEX_HOME: input.codexHome },
       stdio: ["ignore", input.childStdio, input.childStdio],
+      windowsVerbatimArguments: target.wrapped,
+      windowsHide: true,
     });
 
     if (input.childStdio === "pipe") {
@@ -156,6 +266,12 @@ function runDeviceAuth(input: DeviceAuthInput): Promise<DeviceAuthResult> {
     let timedOut = false;
     const timeoutTimer = setTimeout(() => {
       timedOut = true;
+      // behind `cmd.exe` a signal reaches only the wrapper, leaving the real
+      // Codex process orphaned. `taskkill /t` takes the whole tree.
+      if (target.wrapped && child.pid) {
+        spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], { stdio: "ignore" });
+        return;
+      }
       child.kill("SIGTERM");
       // give Codex a grace window to exit cleanly on SIGTERM. if it ignores
       // it, force SIGKILL so we don't pin the CLI on a stuck child.
@@ -171,7 +287,7 @@ function runDeviceAuth(input: DeviceAuthInput): Promise<DeviceAuthResult> {
       const errno = err as NodeJS.ErrnoException;
       const message =
         errno.code === "ENOENT"
-          ? "codex CLI not found on PATH. install it with `npm i -g @openai/codex` or see https://developers.openai.com/codex/cli for other install options."
+          ? codexNotFoundMessage(process.env)
           : `failed to spawn codex: ${errno.message}`;
       reject(new Error(message));
     });
