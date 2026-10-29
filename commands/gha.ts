@@ -4,6 +4,7 @@ import arg from "arg";
 import { main } from "../main.ts";
 import { runOAuthWriteback } from "../utils/oauthWriteback.ts";
 import { maskSecret, saveSecretState, setSecretOutput } from "../utils/secretCommands.ts";
+import { removeAbandonedTempDirectory } from "../utils/setup.ts";
 import { acquireInstallationToken, revokeInstallationToken } from "../utils/token.ts";
 
 // GitHub Actions runs the action entry point with the node24 binary specified
@@ -180,6 +181,7 @@ export async function run(args: string[]) {
   // `failure` with nothing actionable in the comment. that is #815's shape.
   if (args.includes("--post") && !args.includes("token")) {
     await runOAuthWriteback().catch((error) => core.warning(`oauth post-hook: ${error}`));
+    removeAbandonedTempDirectory();
     return;
   }
 

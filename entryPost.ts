@@ -11,11 +11,16 @@
 // no credential never pay an npm bootstrap to find that out —
 // `STATE_oauth_writeback` is exactly what `core.getState` reads, without
 // needing `@actions/core` to resolve. `STATE_subscription_data_dir` is the
-// per-run dir a subscription run must not leave behind (#1475).
+// per-run dir a subscription run must not leave behind (#1475), and
+// `STATE_temp_dir` the temp dir a cancelled run never got to remove.
 
 import { runPullfrogCli } from "./runCli.ts";
 
-if (process.env.STATE_oauth_writeback || process.env.STATE_subscription_data_dir) {
+if (
+  process.env.STATE_oauth_writeback ||
+  process.env.STATE_subscription_data_dir ||
+  process.env.STATE_temp_dir
+) {
   runPullfrogCli({
     cliArgs: ["gha", "--post"],
     // the workflow is over; a bootstrap failure here must not turn a finished
