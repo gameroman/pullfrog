@@ -274,6 +274,8 @@ export interface GitContext {
   //   disabled: no shell, hooks disabled globally, all code execution paths blocked
   shell: ShellPermission;
   postCheckoutScript: string | null;
+  botLogin: string;
+  botUserId: string;
 }
 
 export type SetupGitParams = GitContext;
@@ -329,11 +331,12 @@ export async function configureRepoGit(params: ConfigureRepoGitParams): Promise<
       !currentEmail || currentEmail === "github-actions[bot]@users.noreply.github.com";
 
     if (shouldSetDefaults) {
-      execSync('git config --local user.email "226033991+pullfrog[bot]@users.noreply.github.com"', {
+      const email = `${params.botUserId}+${params.botLogin}@users.noreply.github.com`;
+      execFileSync("git", ["config", "--local", "user.email", email], {
         cwd: repoDir,
         stdio: "pipe",
       });
-      execSync('git config --local user.name "pullfrog[bot]"', {
+      execFileSync("git", ["config", "--local", "user.name", params.botLogin], {
         cwd: repoDir,
         stdio: "pipe",
       });

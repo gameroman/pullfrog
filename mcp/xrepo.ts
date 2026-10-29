@@ -142,6 +142,8 @@ export function CheckoutRepoTool(ctx: ToolContext) {
           toolState: ctx.toolState,
           shell: ctx.payload.shell,
           postCheckoutScript: null,
+          botLogin: ctx.botLogin,
+          botUserId: ctx.botUserId,
         });
 
         log.info(`» checked out secondary repo ${owner}/${repo} (${access}) → ${dir}`);

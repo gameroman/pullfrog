@@ -60,6 +60,11 @@ export interface RepoSettings {
   codexAgent: boolean;
   signedCommits: boolean;
   repoIntelligence: boolean;
+  // the App's bot user, `<slug>[bot]` and its numeric id: the git author for
+  // commits and the login the review prompt uses to recognize its own threads.
+  // a customer-registered App has its own; see wiki/self-hosting.md.
+  botLogin: string;
+  botUserId: string;
   // false suppresses the "Leaping into action..." comment (server-side, before
   // dispatch) and the live task-list updates. see mcp/comment.ts reportProgress.
   progressComments: boolean;
@@ -155,6 +160,8 @@ const defaultSettings: RepoSettings = {
   codexAgent: false,
   signedCommits: false,
   repoIntelligence: false,
+  botLogin: "pullfrog[bot]",
+  botUserId: "226033991",
   progressComments: true,
   statusChecks: true,
   approvalCheck: false,

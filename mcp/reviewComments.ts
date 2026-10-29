@@ -5,7 +5,7 @@ import { type } from "arktype";
 import * as yes from "yes";
 import { resolveBodyAssets } from "../utils/body.ts";
 import { stripExistingFooter } from "../utils/buildPullfrogFooter.ts";
-import { isPullfrog } from "../utils/isPullfrog.ts";
+import { isPullfrog, mentionHandles } from "../utils/isPullfrog.ts";
 import { log } from "../utils/log.ts";
 import { isOutsideAuthor } from "../utils/payload.ts";
 import type { ToolContext } from "./server.ts";
@@ -684,12 +684,12 @@ export function concurrentThreads(
  */
 function mentionsPullfrog(body: string | null | undefined): boolean {
   if (!body) return false;
-  return body
+  const text = body
     .split(/\r?\n/)
     .filter((line) => !line.trim().startsWith(">"))
     .join("\n")
-    .toLowerCase()
-    .includes("@pullfrog");
+    .toLowerCase();
+  return mentionHandles().some((handle) => text.includes(handle));
 }
 
 interface GetReviewDataInput {

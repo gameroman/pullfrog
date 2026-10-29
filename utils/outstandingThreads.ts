@@ -44,6 +44,8 @@ type OutstandingThreadsResponse = {
 export type OutstandingThreadsCtx = {
   octokit: { graphql: <T>(query: string, variables: Record<string, unknown>) => Promise<T> };
   repo: { owner: string; name: string };
+  /** the server's, which knows the owner's own App bot; a run's `isPullfrog` already does. */
+  isPullfrog?: (login: string | null | undefined) => boolean;
 };
 
 /**
@@ -64,6 +66,7 @@ export async function countOutstandingPullfrogThreads(
   ctx: OutstandingThreadsCtx,
   pullNumber: number
 ): Promise<number> {
+  const isOwn = ctx.isPullfrog ?? isPullfrog;
   let count = 0;
   let cursor: string | null = null;
   // bound the walk so a misbehaving cursor can't loop forever; 50 pages = 5000
@@ -77,7 +80,7 @@ export async function countOutstandingPullfrogThreads(
     for (const thread of conn?.nodes ?? []) {
       if (!thread || thread.isResolved) continue;
       const root = thread.comments?.nodes?.find((c) => c != null);
-      if (root && isPullfrog(root.author?.login)) count += 1;
+      if (root && isOwn(root.author?.login)) count += 1;
     }
     if (!conn?.pageInfo.hasNextPage) break;
     cursor = conn.pageInfo.endCursor;

@@ -80,8 +80,20 @@ The 4-backtick fence lets the block hold its own 3-backtick fences and stay one-
 
 Backtick-wrap identifiers and file names. Don't repeat diff content, don't include raw \`+123 / -45\` stats, no changelog, no horizontal rules, and no \`### Key changes\` / \`### Issues found\` / \`<b>TL;DR</b>\` heading — each \`### \` heading IS the issue.`;
 
-export function computeModes(agentId: AgentId, signedCommits = false): Mode[] {
+export function computeModes(params: {
+  agentId: AgentId;
+  signedCommits?: boolean;
+  botLogin?: string;
+}): Mode[] {
+  const agentId = params.agentId;
+  const signedCommits = params.signedCommits ?? false;
+  const botLogin = params.botLogin ?? "pullfrog[bot]";
   const t = (toolName: string) => formatMcpToolRef(agentId, toolName);
+  // an owner on its own App still has threads the shared App opened before the switch.
+  const selfAuthor =
+    botLogin === "pullfrog[bot]"
+      ? "`author=pullfrog[bot]`"
+      : `\`author=${botLogin}\` or \`author=pullfrog[bot]\``;
   // signed-commits mode swaps the local-commit + push flow for the
   // commit_changes tool (API-created, GitHub-signed commits — no push step)
   const commitStep = signedCommits
@@ -265,7 +277,7 @@ ${PR_SUMMARY_FORMAT}`,
 
 4. **prior feedback — read AND retire it**: fetch previous reviews via \`${t("list_pull_request_reviews")}\`, then call \`${t("get_review_comments")}\` on each prior Pullfrog review. Each thread renders as a section whose first line is a fenced tag \`comment author=<login> id=<fullDatabaseId> review=<reviewId> thread=<graphqlId>\`; section headers carry \`[RESOLVED]\` / \`[OUTDATED]\` when relevant. For every **open, Pullfrog-originated** thread, decide and act:
 
-   - **Pullfrog-originated** means the FIRST \`comment author=...\` tag in the section is \`author=pullfrog[bot]\`. The \`*\` marker on individual comments is unrelated — it flags whether a comment belongs to the queried review, not whether it is the thread root.
+   - **Pullfrog-originated** means the FIRST \`comment author=...\` tag in the section is ${selfAuthor}. The \`*\` marker on individual comments is unrelated — it flags whether a comment belongs to the queried review, not whether it is the thread root.
    - **addressed?** read the file at the thread's anchor and judge whether the substantive concern is now resolved by the new commits. Lines being modified isn't enough: reformatting, renaming, or moving the same code elsewhere doesn't address a concern. If the comment raised multiple distinct concerns, ALL must be addressed. The \`[OUTDATED]\` tag means GitHub moved the anchor (line shift, force-push, rename) — it does NOT mean the concern was addressed; re-read the code at its new location before deciding.
    - **if addressed**: call \`${t("reply_to_review_comment")}\` with the root tag's numeric \`id=\` as \`comment_id\` (NOT the \`thread=\` value — that's a separate GraphQL ID used only by resolve) and a one-line body (e.g. \`Addressed in <short-sha>.\`), then call \`${t("resolve_review_thread")}\` with the root tag's \`thread=\` value as \`thread_id\`. Do this BEFORE drafting the new review so the GitHub thread state aligns with the new review by the time it lands.
    - **if uncertain or partially addressed**: leave open. False-positive resolutions erode trust faster than false negatives.
@@ -414,7 +426,7 @@ ${PR_SUMMARY_FORMAT}`,
 // materializes at import, so it carries the BUILD-time prompt profile (env unset → `lean`).
 // its only consumer is the console's built-in-prompt viewer, a client bundle that could never
 // reflect a per-run profile anyway; the run path resolves the profile fresh in `main()`.
-export const modes: Mode[] = computeModes("opencode");
+export const modes: Mode[] = computeModes({ agentId: "opencode" });
 
 /**
  * modes that legitimately never modify the working tree. used by the post-run

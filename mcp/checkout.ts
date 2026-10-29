@@ -817,6 +817,8 @@ export function CheckoutPrTool(ctx: ToolContext) {
       toolState: ctx.toolState,
       shell: ctx.payload.shell,
       postCheckoutScript: ctx.postCheckoutScript,
+      botLogin: ctx.botLogin,
+      botUserId: ctx.botUserId,
       beforeSha: primary.beforeSha,
       signal,
     });

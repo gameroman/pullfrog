@@ -46,6 +46,7 @@ import {
   writeGitHubUsageSummaryToFile,
 } from "./utils/github.ts";
 import { resolveInstructions } from "./utils/instructions.ts";
+import { setBotLogin } from "./utils/isPullfrog.ts";
 import {
   persistLearnings,
   persistXrepoLearnings,
@@ -169,6 +170,7 @@ export async function main(): Promise<MainResult> {
       typeof resolvedPromptInput === "string" ? undefined : resolvedPromptInput.routing?.tier,
   });
   timer.checkpoint("runContextData");
+  setBotLogin(runContext.repoSettings.botLogin);
 
   const payload = resolvePayload(resolvedPromptInput, runContext.repoSettings);
 
@@ -615,6 +617,8 @@ export async function main(): Promise<MainResult> {
       toolState,
       shell: payload.shell,
       postCheckoutScript: runContext.repoSettings.postCheckoutScript,
+      botLogin: runContext.repoSettings.botLogin,
+      botUserId: runContext.repoSettings.botUserId,
     });
     timer.checkpoint("git");
 
@@ -663,7 +667,11 @@ export async function main(): Promise<MainResult> {
 
     const agentId = agent.name;
     const modes = [
-      ...computeModes(agentId, runContext.repoSettings.signedCommits),
+      ...computeModes({
+        agentId,
+        signedCommits: runContext.repoSettings.signedCommits,
+        botLogin: runContext.repoSettings.botLogin,
+      }),
       ...runContext.repoSettings.modes,
     ];
 
@@ -692,6 +700,8 @@ export async function main(): Promise<MainResult> {
       apiToken: runContext.apiToken,
       modes,
       postCheckoutScript: runContext.repoSettings.postCheckoutScript,
+      botLogin: runContext.repoSettings.botLogin,
+      botUserId: runContext.repoSettings.botUserId,
       prepushScript: runContext.repoSettings.prepushScript,
       prApproveEnabled: runContext.repoSettings.prApproveEnabled,
       reviewDrafts: runContext.repoSettings.reviewDrafts,

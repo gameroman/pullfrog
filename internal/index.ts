@@ -118,7 +118,7 @@ export { isCredentialProbeable, verifyCredential } from "../utils/credentialChec
 export { renderFailure } from "../utils/failureBody.ts";
 export { GENERATED } from "../utils/generatedFiles.ts";
 export type { ResourceUsage, UsageSummary } from "../utils/github.ts";
-export { isPullfrog } from "../utils/isPullfrog.ts";
+export { isBotLogin, isPullfrog } from "../utils/isPullfrog.ts";
 export {
   isLeapingIntoActionCommentBody,
   isLiveChecklistCommentBody,

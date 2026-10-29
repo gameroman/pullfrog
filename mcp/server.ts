@@ -81,6 +81,8 @@ export interface ToolContext {
   apiToken: string;
   modes: Mode[];
   postCheckoutScript: string | null;
+  botLogin: string;
+  botUserId: string;
   prepushScript: string | null;
   prApproveEnabled: boolean;
   reviewDrafts: boolean;
