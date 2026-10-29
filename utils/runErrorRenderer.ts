@@ -109,6 +109,8 @@ type RenderRunErrorInput = {
   credential?: AgentCredential | undefined;
   /** the run was served by the account's free trial credits. */
   trial?: boolean | undefined;
+  /** why opencode's live model catalog could not be downloaded, leaving it on its build-time snapshot. */
+  modelsCatalogFailure?: string | undefined;
 };
 
 /** who answered the request, as the customer knows them. */
@@ -381,6 +383,19 @@ function formatProviderModelNotFound(ctx: RenderContext): string {
   const suggested = suggestions?.length
     ? ` OpenCode suggests ${suggestions.slice(0, -1).join(", ")}${suggestions.length > 1 ? " or " : ""}${suggestions.at(-1)}.`
     : "";
+  if (ctx.modelsCatalogFailure) {
+    return renderFailure({
+      headline: model
+        ? `OpenCode couldn't download its model list, so it didn't recognize \`${model}\`.`
+        : "OpenCode couldn't download its model list, so it didn't recognize this repo's model.",
+      detail: `It fell back to the copy built into it, which lacks models released since that build. Re-run once the runner can reach OpenCode's model catalog, or pick an older model.${suggested}`,
+      details: {
+        summary: "Why the download failed",
+        text: `${ctx.modelsCatalogFailure}\n\n${ctx.errorMessage}`,
+      },
+      links: [pickModelLink(ctx.repo)],
+    });
+  }
   return renderFailure({
     headline: model
       ? `\`${model}\` isn't in OpenCode's catalog.`

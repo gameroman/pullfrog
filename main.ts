@@ -59,6 +59,8 @@ import {
   captureAuthorizedModels,
   captureBaselineModels,
   getAuthorizedModels,
+  getModelsCatalogFailure,
+  seedModelsCatalog,
 } from "./utils/openCodeModels.ts";
 import { applyOverrides } from "./utils/overrides.ts";
 import {
@@ -257,6 +259,9 @@ export async function main(): Promise<MainResult> {
   const repoDir = payload.cwd;
   const preIntrospectionDirty = repoDir ? await dirtyTrackedPaths({ cwd: repoDir }) : null;
   const opencodeCliPath = await agents.opencode.install();
+  // not alongside the install: its `spawnSync` tar extraction blocks the event loop, which spent the
+  // download's timeout on every first attempt on a hosted runner
+  await seedModelsCatalog(tmpdir);
   captureBaselineModels({ cliPath: opencodeCliPath, tmpdir });
 
   // DRAGON: nothing above this block may resolve a model or read a provider env var — console-stored
@@ -1068,6 +1073,7 @@ export async function main(): Promise<MainResult> {
       model: toolState.model,
       credential: toolState.credential,
       trial: toolState.modelClamped?.reason === "trial",
+      modelsCatalogFailure: getModelsCatalogFailure(),
     });
     await writeRunErrorOutputs({ rendered, toolState });
 
