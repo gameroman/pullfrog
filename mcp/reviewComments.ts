@@ -5,7 +5,7 @@ import { type } from "arktype";
 import * as yes from "yes";
 import { resolveBodyAssets } from "../utils/body.ts";
 import { stripExistingFooter } from "../utils/buildPullfrogFooter.ts";
-import { isPullfrog, mentionHandles } from "../utils/isPullfrog.ts";
+import { isPullfrog, mentionableText, mentionHandles } from "../utils/isPullfrog.ts";
 import { log } from "../utils/log.ts";
 import { isOutsideAuthor } from "../utils/payload.ts";
 import type { ToolContext } from "./server.ts";
@@ -680,15 +680,12 @@ export function concurrentThreads(
 /**
  * Mirrors the server-side `containsTriggerPhrase` gate that decided this run was
  * dispatched at all: blockquoted mentions don't count, so quoting someone else's
- * `@pullfrog` while replying doesn't pull an unrelated thread into scope.
+ * `@pullfrog` while replying doesn't pull an unrelated thread into scope. Neither
+ * does one shown in code.
  */
 function mentionsPullfrog(body: string | null | undefined): boolean {
   if (!body) return false;
-  const text = body
-    .split(/\r?\n/)
-    .filter((line) => !line.trim().startsWith(">"))
-    .join("\n")
-    .toLowerCase();
+  const text = mentionableText(body).toLowerCase();
   return mentionHandles().some((handle) => text.includes(handle));
 }
 

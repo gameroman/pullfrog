@@ -27,6 +27,19 @@ export function isBotLogin(actor: string | null | undefined, botLogin: string): 
   return !!actor && normalize(actor) === normalize(botLogin);
 }
 
+/**
+ * the part of a body a mention can request a run from: quoted lines are someone else's
+ * words and code is an example, and GitHub sends no notification for a mention in code.
+ */
+export function mentionableText(body: string): string {
+  return body
+    .replace(/(`{3,}|~{3,})[\s\S]*?(?:\1|$)/g, "")
+    .replace(/`[^`\n]*`/g, "")
+    .split(/\r?\n/)
+    .filter((line) => !line.trim().startsWith(">"))
+    .join("\n");
+}
+
 /** the handles a mention of this run's bot can use; a custom App may have been renamed. */
 export function mentionHandles(): string[] {
   return [...new Set(["@pullfrog", `@${runBotLogin}`])];
