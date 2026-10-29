@@ -10,12 +10,14 @@ const CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for 
 // fallback probe model for runs with no explicit model (claude-code picks its
 // own default there, so per-model accuracy is moot — only whether the
 // subscription answers at all). registry-resolved so the models-bump cron
-// keeps the id fresh.
-const fallbackResolve = resolveModelSlug("anthropic/claude-haiku");
-if (!fallbackResolve) {
-  throw new Error("claudeSubscription preflight: anthropic/claude-haiku missing from registry");
+// keeps the id fresh. read per call, so a registry run-context served applies.
+function fallbackProbeModel(): string {
+  const resolve = resolveModelSlug("anthropic/claude-haiku");
+  if (!resolve) {
+    throw new Error("claudeSubscription preflight: anthropic/claude-haiku missing from registry");
+  }
+  return resolve.slice(resolve.indexOf("/") + 1);
 }
-const FALLBACK_PROBE_MODEL = fallbackResolve.slice(fallbackResolve.indexOf("/") + 1);
 
 /**
  * `status` is the HTTP status Anthropic answered with, or `undefined` when we
@@ -54,6 +56,7 @@ export async function preflightClaudeSubscription(params: {
   /** bare Anthropic model id the run will use (e.g. "claude-fable-5") */
   model: string | undefined;
 }): Promise<SubscriptionPreflight> {
+  const model = params.model ?? fallbackProbeModel();
   let res: Response;
   try {
     res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -66,7 +69,7 @@ export async function preflightClaudeSubscription(params: {
         "x-app": "cli",
       },
       body: JSON.stringify({
-        model: params.model ?? FALLBACK_PROBE_MODEL,
+        model,
         max_tokens: 1,
         system: CLAUDE_CODE_IDENTITY,
         messages: [{ role: "user", content: "ok" }],

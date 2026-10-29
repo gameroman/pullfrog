@@ -1,14 +1,20 @@
 import type { Octokit } from "@octokit/rest";
 import * as yes from "yes";
-import type { RouterTier } from "../models.ts";
+import { installProviders, type RouterTier } from "../models.ts";
 import packageJson from "../package.json" with { type: "json" };
 import type { CommercialRefusal } from "./billingErrors.ts";
 import { log } from "./cli.ts";
 import { mintIdToken, type OctokitWithPlugins, parseRepoContext } from "./github.ts";
 import { isTransientOctokitError } from "./isTransientNetworkError.ts";
-import { type AccountPlan, fetchRunContext, type RepoSettings } from "./runContext.ts";
+import {
+  type AccountPlan,
+  fetchRunContext,
+  type ModelRegistry,
+  type RepoSettings,
+} from "./runContext.ts";
 import { maskSecret } from "./secretCommands.ts";
 import type { CredentialAccess } from "./subscriptionCredentials.ts";
+import { getHarnessPins } from "./version.ts";
 
 export interface RunContextData {
   credentialAccess?: CredentialAccess | undefined;
@@ -50,6 +56,28 @@ interface ResolveRunContextDataParams {
   plainPrompt: boolean;
   /** the model router's tier from the payload, forwarded so run-context applies it to the proxy mint. */
   routedTier?: RouterTier | undefined;
+}
+
+/**
+ * Swaps in the deployed server's alias registry, so a merged `action/models.ts` change reaches this
+ * run without waiting for a release. A registry written against other harness pins waits for the
+ * release that carries them: a model bump that needs a newer CLI would otherwise reach this one.
+ */
+function installServedRegistry(served: ModelRegistry): void {
+  const pins = getHarnessPins();
+  const moved = Object.keys(pins).filter((name) => served.harnessPins[name] !== pins[name]);
+  if (moved.length > 0) {
+    const theirs = moved.map((name) => `${name}@${served.harnessPins[name]}`).join(", ");
+    log.info(`» kept the bundled model registry: the server's is written for ${theirs}`);
+    return;
+  }
+  try {
+    installProviders(served.providers);
+  } catch (error) {
+    log.warning(
+      `» kept the bundled model registry: the server's ${error instanceof Error ? error.message : error}`
+    );
+  }
 }
 
 /**
@@ -108,6 +136,7 @@ export async function resolveRunContextData(
   ]);
 
   if (runContext.apiToken) maskSecret(runContext.apiToken);
+  if (runContext.modelRegistry) installServedRegistry(runContext.modelRegistry);
   return {
     repo: {
       owner: repoContext.owner,

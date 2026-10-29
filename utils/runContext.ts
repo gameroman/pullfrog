@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { PushPermission, ShellPermission } from "../external.ts";
-import type { RouterTier } from "../models.ts";
+import type { ProviderConfig, RouterTier } from "../models.ts";
 import { apiFetch } from "./apiFetch.ts";
 import type { CommercialRefusal } from "./billingErrors.ts";
 import type { RepoContext } from "./github.ts";
@@ -129,6 +129,14 @@ export interface RunContext {
   /** the trial account's remaining funded credits, in USD, when it is inside its
    * trial at all. zero or below means the credits are used up. */
   trialCreditsLeftUsd?: number | undefined;
+  /** the deployed server's alias registry, which replaces the one bundled into this build. */
+  modelRegistry?: ModelRegistry | undefined;
+}
+
+export interface ModelRegistry {
+  providers: Record<string, ProviderConfig>;
+  /** the harness CLIs the server's registry was written against. see `getHarnessPins`. */
+  harnessPins: Record<string, string>;
 }
 
 const defaultSettings: RepoSettings = {
@@ -254,6 +262,7 @@ export async function fetchRunContext(params: {
       routerUnfunded?: boolean;
       trialFallback?: boolean;
       trialCreditsLeftUsd?: number;
+      modelRegistry?: ModelRegistry;
     } | null;
 
     if (data === null) {
@@ -284,6 +293,7 @@ export async function fetchRunContext(params: {
       routerUnfunded: data.routerUnfunded,
       trialFallback: data.trialFallback,
       trialCreditsLeftUsd: data.trialCreditsLeftUsd,
+      modelRegistry: data.modelRegistry,
     };
   } catch {
     // network drop, abort at the 30s timeout, or an unparseable body — we never

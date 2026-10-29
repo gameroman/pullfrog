@@ -84,6 +84,8 @@ export {
   TRIAL_FUNDED_USD_LIMIT,
 } from "../external.ts";
 export {
+  bundledProviders,
+  installProviders,
   isOpenAICompatibleSetName,
   openAICompatibleEnv,
   openAICompatibleSetAlias,
@@ -137,6 +139,7 @@ export {
 } from "../utils/progressComment.ts";
 export { PROVIDER_DASHBOARDS, type ProviderDashboard } from "../utils/providerDashboards.ts";
 export { detectProviderError } from "../utils/providerErrors.ts";
+export { applyPublishedCatalogs, fetchPublishedCatalogs } from "../utils/publishedCatalogs.ts";
 export type {
   RunStatusCheckConclusion,
   RunStatusCheckOctokit,
@@ -159,6 +162,7 @@ export {
   parseTimeString,
   TIMEOUT_DISABLED,
 } from "../utils/time.ts";
+export { getHarnessPins } from "../utils/version.ts";
 export type { XaiAuthBody } from "../utils/xaiOAuth.ts";
 export {
   parseXaiAuthBody,

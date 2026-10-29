@@ -89,7 +89,7 @@ interface ModelDef {
   /** concrete models.dev specifier, e.g. "anthropic/claude-opus-4-6" */
   resolve: string;
   /** full models.dev specifier for the OpenRouter equivalent, e.g. "openrouter/anthropic/claude-opus-4.6" */
-  openRouterResolve?: string;
+  openRouterResolve?: string | undefined;
   preferred?: boolean;
   envVars?: readonly string[];
   isFree?: boolean;
@@ -103,11 +103,15 @@ interface ModelDef {
    * use as its lens-fanout subagent (e.g. claude-opus → "claude-sonnet"). */
   subagentModel?: string;
   /** effort rungs accepted on the direct route, ascending — see ModelAlias.effort */
-  effort?: readonly string[];
+  effort?: readonly string[] | undefined;
   /** effort rungs on the OpenRouter route when they differ — see ModelAlias.openRouterEffort */
-  openRouterEffort?: readonly string[];
+  openRouterEffort?: readonly string[] | undefined;
   /** hide from selectable lists. does NOT affect resolution; for that use `fallback`. */
   hidden?: boolean;
+  /** `resolve` and `openRouterResolve` are chosen by hand (a rolling `~…-latest` pointer, a `-pro`
+   * id models.dev lacks, a dated or held-back build), so the server never looks them up by
+   * models.dev's canonical id. see wiki/model-resolution.md. */
+  pinned?: boolean;
 }
 
 export interface ProviderConfig {
@@ -127,7 +131,8 @@ function provider(config: ProviderConfig): ProviderConfig {
   return config;
 }
 
-export const providers = {
+/** this build's own registry. `providers` starts as this copy and `installProviders` replaces it. */
+export const bundledProviders = {
   anthropic: provider({
     displayName: "Anthropic",
     envVars: ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"],
@@ -148,6 +153,7 @@ export const providers = {
         // stay catalog-valid and auto-follow version bumps.
         openRouterResolve: "openrouter/~anthropic/claude-fable-latest",
         subagentModel: "claude-sonnet",
+        pinned: true,
       },
       "claude-opus": {
         displayName: "Claude Opus",
@@ -206,6 +212,7 @@ export const providers = {
         effort: ["low", "medium", "high", "xhigh", "max"],
         openRouterResolve: "openrouter/openai/gpt-6.1-sol-pro",
         subagentModel: "gpt-sol",
+        pinned: true,
       },
       // gpt-5.6's balanced mid-tier. selectable on its own and doubles as Sol's
       // cheaper lens-fanout subagent — replaces the old hidden gpt-5.4 target.
@@ -394,6 +401,7 @@ export const providers = {
         effort: ["low", "high", "max"],
         openRouterEffort: ["none", "low", "high", "max"],
         openRouterResolve: "openrouter/deepseek/deepseek-v4.1-flash",
+        pinned: true,
       },
       // legacy aliases — deepseek retires these on 2026-07-24; transparently
       // upgrade existing users to the v4 family via the fallback chain.
@@ -569,6 +577,7 @@ export const providers = {
         effort: ["low", "medium", "high", "xhigh", "max"],
         openRouterResolve: "openrouter/~anthropic/claude-fable-latest",
         subagentModel: "claude-sonnet",
+        pinned: true,
       },
       "claude-opus": {
         displayName: "Claude Opus",
@@ -617,6 +626,7 @@ export const providers = {
         effort: ["low", "medium", "high", "xhigh", "max"],
         openRouterResolve: "openrouter/openai/gpt-6.1-sol-pro",
         subagentModel: "gpt-sol",
+        pinned: true,
       },
       // gpt-5.6 balanced mid-tier — selectable + Sol's subagent. see openai above.
       "gpt-terra": {
@@ -704,6 +714,7 @@ export const providers = {
         // guard permits the step down because k2.7-code is in ZEN_UNDEPLOYED.
         resolve: "opencode/kimi-k2.6",
         openRouterResolve: "openrouter/moonshotai/kimi-k2.7-code",
+        pinned: true,
       },
       // M3 is its own line beside M2, not a bump of it — same reason `kimi-k3`
       // sits beside `kimi-k2` rather than replacing it.
@@ -1173,12 +1184,14 @@ export const providers = {
         openRouterResolve: "openrouter/~anthropic/claude-opus-latest",
         preferred: true,
         subagentModel: "claude-sonnet",
+        pinned: true,
       },
       "claude-sonnet": {
         displayName: "Claude Sonnet",
         resolve: "openrouter/~anthropic/claude-sonnet-latest",
         effort: ["low", "medium", "high", "xhigh", "max"],
         openRouterResolve: "openrouter/~anthropic/claude-sonnet-latest",
+        pinned: true,
       },
       "claude-haiku": {
         displayName: "Claude Haiku",
@@ -1187,6 +1200,7 @@ export const providers = {
         // the ladder Haiku 4.5 did not.
         effort: ["none", "low", "medium", "high", "xhigh", "max"],
         openRouterResolve: "openrouter/~anthropic/claude-haiku-latest",
+        pinned: true,
       },
       // pinned to the explicit Sol/Terra/Luna tiers (not the ~openai/gpt-latest
       // rolling alias): after that rename, ~gpt-mini-latest no longer maps
@@ -1214,6 +1228,7 @@ export const providers = {
         effort: ["low", "medium", "high", "xhigh", "max"],
         openRouterResolve: "openrouter/openai/gpt-6.1-sol-pro",
         subagentModel: "gpt-sol",
+        pinned: true,
       },
       // gpt-5.6 balanced mid-tier — selectable + Sol's subagent. see openai above.
       "gpt-terra": {
@@ -1280,6 +1295,7 @@ export const providers = {
         effort: ["low", "medium", "high"],
         openRouterResolve: "openrouter/~google/gemini-pro-latest",
         // Inherit — see google/gemini-pro for rationale.
+        pinned: true,
       },
       "gemini-flash": {
         displayName: "Gemini Flash",
@@ -1289,6 +1305,7 @@ export const providers = {
         // mirrors exactly: claude-code hard-errors on an out-of-range `--effort`.
         effort: ["low", "medium", "high"],
         openRouterResolve: "openrouter/~google/gemini-flash-latest",
+        pinned: true,
       },
       grok: {
         displayName: "Grok",
@@ -1312,6 +1329,7 @@ export const providers = {
         resolve: "openrouter/deepseek/deepseek-v4.1-flash",
         effort: ["none", "low", "high", "max"],
         openRouterResolve: "openrouter/deepseek/deepseek-v4.1-flash",
+        pinned: true,
       },
       // legacy alias — deepseek retires this on 2026-07-24; transparently
       // upgrade existing users to the v4 family via the fallback chain.
@@ -1469,7 +1487,10 @@ export const providers = {
   }),
 } satisfies Record<string, ProviderConfig>;
 
-export type ModelProvider = keyof typeof providers;
+/** the registry every lookup below reads: this file's copy, until `installProviders` swaps in the server's. */
+export let providers: Record<string, ProviderConfig> = bundledProviders;
+
+export type ModelProvider = keyof typeof bundledProviders;
 
 // ── slug parsing ───────────────────────────────────────────────────────────────
 
@@ -1619,9 +1640,9 @@ export function resolvePickModel(params: {
 
 // ── derived flat list ──────────────────────────────────────────────────────────
 
-export const modelAliases: ModelAlias[] = Object.entries(providers).flatMap(
-  ([providerKey, config]) =>
-    Object.entries(config.models).map(([modelId, def]) => ({
+function flattenAliases(source: Record<string, ProviderConfig>): ModelAlias[] {
+  return Object.entries(source).flatMap(([providerKey, config]) =>
+    Object.entries(config.models).map(([modelId, def]: [string, ModelDef]) => ({
       slug: `${providerKey}/${modelId}`,
       provider: providerKey,
       displayName: def.displayName,
@@ -1640,7 +1661,10 @@ export const modelAliases: ModelAlias[] = Object.entries(providers).flatMap(
       openRouterEffort: def.openRouterEffort,
       hidden: def.hidden ?? false,
     }))
-);
+  );
+}
+
+export let modelAliases: ModelAlias[] = flattenAliases(providers);
 
 // ── auto tiers ───────────────────────────────────────────────────────────────
 
@@ -1820,9 +1844,7 @@ export function autoRoutedSlug(provider: string): string {
 }
 
 /** the providers a BYOK repo can put on Auto — exactly the ones with a ladder */
-export const ROUTED_PROVIDERS: readonly { key: string; displayName: string }[] = Object.keys(
-  PROVIDER_LADDERS
-).map((key) => ({ key, displayName: providers[key as keyof typeof providers].displayName }));
+export let ROUTED_PROVIDERS: readonly { key: string; displayName: string }[];
 
 /**
  * a ladder's distinct models in ascending order, each with the tiers it
@@ -1960,38 +1982,32 @@ export function resolveModelRung(params: {
  * model is given a `fallback` (e.g. to ride out a temporary outage) the OSS/Router
  * default follows the substitute instead of pinning the unavailable model.
  */
-const defaultProxyAlias = resolveDisplayAlias(AUTO_EFFICIENT);
-if (!defaultProxyAlias?.openRouterResolve) {
-  throw new Error(`DEFAULT_PROXY_MODEL: ${AUTO_EFFICIENT} has no openRouterResolve`);
-}
-export const DEFAULT_PROXY_MODEL = defaultProxyAlias.openRouterResolve;
-const defaultProxyDisplayName = defaultProxyAlias.displayName;
+export let DEFAULT_PROXY_MODEL: string;
+let defaultProxyDisplayName: string;
 
 /**
  * what a Pullfrog-funded trial run falls back to. apart from `DEFAULT_PROXY_MODEL` because the
  * trial is capped at `TRIAL_FUNDED_USD_LIMIT` per account, so first-impression quality outranks price.
  * see wiki/trial-model-fallback.md.
  */
-const trialProxyAlias = resolveDisplayAlias("openai/gpt-luna");
-if (!trialProxyAlias?.openRouterResolve) {
-  throw new Error("TRIAL_PROXY_MODEL: openai/gpt-luna has no openRouterResolve");
-}
-export const TRIAL_PROXY_MODEL = trialProxyAlias.openRouterResolve;
-export const TRIAL_PROXY_DISPLAY_NAME = trialProxyAlias.displayName;
+export let TRIAL_PROXY_MODEL: string;
+export let TRIAL_PROXY_DISPLAY_NAME: string;
 /** lifetime cap, in USD, on the model usage Pullfrog funds for an account's trial runs. */
 export const TRIAL_FUNDED_USD_LIMIT = 10;
 
 // every router ladder rung must be a live alias, for the same reason the proxy default is checked —
 // and the rungs must reach two models, or the ladder routes nothing (a cheap rung whose alias
 // falls back to the top rung passed the first check while every tier ran the same model)
-for (const [name, ladder] of Object.entries({ ...PROVIDER_LADDERS, router: ROUTER_LADDER })) {
-  const terminal = new Set<string>();
-  for (const slug of Object.values(ladder)) {
-    const alias = resolveDisplayAlias(slug);
-    if (!alias) throw new Error(`${name} ladder names unknown alias ${slug}`);
-    terminal.add(alias.slug);
+function checkLadders(): void {
+  for (const [name, ladder] of Object.entries({ ...PROVIDER_LADDERS, router: ROUTER_LADDER })) {
+    const terminal = new Set<string>();
+    for (const slug of Object.values(ladder)) {
+      const alias = resolveDisplayAlias(slug);
+      if (!alias) throw new Error(`${name} ladder names unknown alias ${slug}`);
+      terminal.add(alias.slug);
+    }
+    if (terminal.size < 2) throw new Error(`${name} ladder runs every tier on ${[...terminal][0]}`);
   }
-  if (terminal.size < 2) throw new Error(`${name} ladder runs every tier on ${[...terminal][0]}`);
 }
 
 // ── OSS allowlist ──────────────────────────────────────────────────────────────
@@ -2068,13 +2084,54 @@ export function ossFundedModelNames(): string[] {
  * the slug is what makes `openrouter/deepseek-flash` and `deepseek/deepseek-flash`
  * the same funded model — both spellings are stored in the wild.
  */
-const ossAllowedTargets = new Set(
-  OSS_MODEL_ALLOWLIST.map((slug) => {
+let ossAllowedTargets: Set<string>;
+
+/** rebuilds everything read off `providers` at load, throwing where a registry would break a run */
+function deriveFromProviders(): void {
+  const efficient = resolveDisplayAlias(AUTO_EFFICIENT);
+  if (!efficient?.openRouterResolve) {
+    throw new Error(`DEFAULT_PROXY_MODEL: ${AUTO_EFFICIENT} has no openRouterResolve`);
+  }
+  const trial = resolveDisplayAlias("openai/gpt-luna");
+  if (!trial?.openRouterResolve) {
+    throw new Error("TRIAL_PROXY_MODEL: openai/gpt-luna has no openRouterResolve");
+  }
+  checkLadders();
+  const allowed = OSS_MODEL_ALLOWLIST.map((slug) => {
     const target = resolveOpenRouterModel(slug);
     if (!target) throw new Error(`OSS_MODEL_ALLOWLIST: ${slug} has no openRouterResolve`);
     return target;
-  })
-);
+  });
+  DEFAULT_PROXY_MODEL = efficient.openRouterResolve;
+  defaultProxyDisplayName = efficient.displayName;
+  TRIAL_PROXY_MODEL = trial.openRouterResolve;
+  TRIAL_PROXY_DISPLAY_NAME = trial.displayName;
+  ossAllowedTargets = new Set(allowed);
+  ROUTED_PROVIDERS = Object.keys(PROVIDER_LADDERS).map((key) => ({
+    key,
+    displayName: providers[key]?.displayName ?? key,
+  }));
+}
+deriveFromProviders();
+
+/**
+ * Swaps in the server's copy of `providers`, so a merged registry change reaches runs at deploy
+ * rather than at the next release. A copy this build can't derive from (an alias its proxy
+ * defaults, ladders or OSS allowlist need is gone) is refused, and the bundled one stays.
+ */
+export function installProviders(next: Record<string, ProviderConfig>): void {
+  const previous = providers;
+  try {
+    providers = next;
+    modelAliases = flattenAliases(next);
+    deriveFromProviders();
+  } catch (error) {
+    providers = previous;
+    modelAliases = flattenAliases(previous);
+    deriveFromProviders();
+    throw error;
+  }
+}
 
 /**
  * whether an OSS repo's stored pick is one the program funds. resolves through

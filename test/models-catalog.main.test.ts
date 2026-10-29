@@ -1,26 +1,21 @@
-import { type } from "arktype";
 import { describe, expect, it } from "vitest";
-import { DEFAULT_PROXY_MODEL, modelAliases, resolveDisplayAlias } from "../models.ts";
+import {
+  bundledProviders,
+  DEFAULT_PROXY_MODEL,
+  installProviders,
+  modelAliases,
+  resolveDisplayAlias,
+} from "../models.ts";
+import {
+  applyPublishedCatalogs,
+  fetchPublishedCatalogs,
+  ZEN_UNDEPLOYED,
+} from "../utils/publishedCatalogs.ts";
 
-/**
- * models Zen LISTS in `/zen/v1/models` but will not actually serve — the
- * endpoint answers 400 `[NOT_FOUND] ... not deployed`. Membership is not
- * availability, and the catalog checks read membership, so without this they
- * stay green on a dead model AND actively block the fix: `opencode mirrors
- * don't trail their siblings` reads the same list, so it forces a mirror onto
- * an undeployed build and rejects the step down to a served one.
- *
- * Deliberately a hand-maintained literal rather than a live probe. `test:catalog`
- * is the release gate in `push-to-action.yml` precisely because it makes no
- * provider calls; adding them would hand any mute provider a veto over shipping.
- * Add an entry when `models-live` — which does call the model — catches one,
- * and delete it once the model completes a run again.
- */
-const ZEN_UNDEPLOYED: string[] = [
-  // 2026-08-28: 400 `[NOT_FOUND] ... not deployed` on both Zen tiers, while
-  // kimi-k2.6 and kimi-k3 answer 200 on the same key.
-  "kimi-k2.7-code",
-];
+// assert over the registry runs actually resolve with: the bundled one, rewritten from the
+// published catalogs the way the server serves it (`utils/liveProviders.ts`)
+const catalogs = await fetchPublishedCatalogs(AbortSignal.timeout(60_000));
+installProviders(applyPublishedCatalogs({ catalogs, providers: bundledProviders }));
 
 // ── catalog drift tests ─────────────────────────────────────────────────────
 //
@@ -125,67 +120,6 @@ describe("openRouterResolve models.dev validity", async () => {
   }
 });
 
-// the registry mirrors models.dev's published effort ladders rather than
-// fetching them per run. drift is not cosmetic: claude-code hard-errors on an
-// out-of-range `--effort` before it makes any API call, so a stale ladder
-// breaks runs outright. see wiki/effort.md.
-describe("effort ladders mirror published catalogs", async () => {
-  const data = await api;
-  // the gateway's own catalog takes precedence: models.dev incorrectly
-  // advertises `none` for Astra, which requires reasoning on every route.
-  const gateway = type({
-    data: type({
-      id: "string",
-      "reasoning_options?": type({ type: "string", "values?": "string[]" }).array(),
-    }).array(),
-  }).assert(await fetch("https://ai-gateway.vercel.sh/v1/models").then((r) => r.json()));
-
-  const publishedEffort = (spec: string) => {
-    const parsed = parseResolve(spec);
-    const model =
-      parsed.provider === "vercel"
-        ? gateway.data.find((m) => m.id === parsed.modelId)
-        : data[parsed.provider]?.models[parsed.modelId];
-    const options = model?.reasoning_options;
-    return options?.find((o) => o.type === "effort")?.values;
-  };
-
-  // "no rungs" has two spellings and the whole runtime already collapses them:
-  // `resolveRung` returns undefined on an empty ladder, and both console pickers
-  // call `offeredRungs(published ?? [])`. only this assertion distinguished them,
-  // which left a model whose route publishes a reasoning TOGGLE inexpressible —
-  // an absent `openRouterEffort` falls through to `effort`, so the alias could
-  // not say "the direct route has a ladder, this one has none" without failing.
-  const rungs = (values: readonly string[] | undefined) => (values?.length ? values : undefined);
-
-  for (const alias of modelAliases) {
-    if (alias.routing || alias.fallback) continue;
-
-    it(`${alias.slug} effort matches its published catalog`, () => {
-      // the Go GLM Flash endpoint rejects reasoning_effort even though models.dev
-      // lists effort rungs; preserve the observed transport contract until fixed.
-      if (alias.slug === "opencode-go/glm-flash") {
-        expect(rungs(publishedEffort(alias.resolve))).toBeDefined();
-        expect(alias.effort).toEqual([]);
-        return;
-      }
-      expect(rungs(publishedEffort(alias.resolve))).toEqual(rungs(alias.effort));
-    });
-
-    // hoisted so the narrowing survives into the callback
-    const routerResolve = alias.openRouterResolve;
-    if (routerResolve) {
-      it(`${alias.slug} openRouterEffort matches models.dev`, () => {
-        // an absent openRouterEffort means "same ladder as direct"; `[]` means
-        // "this route publishes none", which is not the same claim.
-        expect(rungs(publishedEffort(routerResolve))).toEqual(
-          rungs(alias.openRouterEffort ?? alias.effort)
-        );
-      });
-    }
-  }
-});
-
 describe("DEFAULT_PROXY_MODEL models.dev validity", async () => {
   const data = await api;
   const parsed = parseResolve(DEFAULT_PROXY_MODEL);
@@ -209,16 +143,8 @@ describe("DEFAULT_PROXY_MODEL models.dev validity", async () => {
   });
 });
 
-type OpenRouterModel = { id: string };
-type OpenRouterModelsResponse = { data: OpenRouterModel[] };
-
-const openRouterApi = fetch("https://openrouter.ai/api/v1/models").then(
-  (r) => r.json() as Promise<OpenRouterModelsResponse>
-);
-
-describe("openRouterResolve OpenRouter API validity", async () => {
-  const orData = await openRouterApi;
-  const orModelIds = new Set(orData.data.map((m) => m.id));
+describe("openRouterResolve OpenRouter API validity", () => {
+  const orModelIds = catalogs.served.openrouter;
   const seen = new Set<string>();
 
   for (const alias of modelAliases) {
@@ -256,19 +182,11 @@ describe("openRouterResolve OpenRouter API validity", async () => {
 // aliases legitimately point at dead resolve targets — the terminal is what
 // actually runs at the agent CLI.
 
-type ZenModel = { id: string };
-type ZenModelsResponse = { data: ZenModel[] };
-
-const zenApi = fetch("https://opencode.ai/zen/v1/models").then(
-  (r) => r.json() as Promise<ZenModelsResponse>
-);
-
-describe("opencode Zen served list", async () => {
-  const zenData = await zenApi;
+describe("opencode Zen served list", () => {
   // listing is not serving — subtract the models measured as undeployed, so a
   // dead model fails here instead of passing on catalog membership alone.
   const zenIds = new Set(
-    zenData.data.map((m) => m.id).filter((id) => !ZEN_UNDEPLOYED.includes(id))
+    [...catalogs.served.opencode].filter((id) => !ZEN_UNDEPLOYED.includes(id))
   );
   const seen = new Set<string>();
 
@@ -302,7 +220,7 @@ describe("opencode mirrors don't trail their siblings", async () => {
   // will not serve is not "ahead", and treating it as ahead pins this mirror to
   // the dead build and rejects the step down to a served one.
   const zenIds = new Set(
-    (await zenApi).data.map((m) => m.id).filter((id) => !ZEN_UNDEPLOYED.includes(id))
+    [...catalogs.served.opencode].filter((id) => !ZEN_UNDEPLOYED.includes(id))
   );
   const modelId = (spec: string) => spec.slice(spec.lastIndexOf("/") + 1);
   const aliasKey = (slug: string) => slug.slice(slug.indexOf("/") + 1);
